@@ -27,7 +27,7 @@ questions: [`docs/m0-walkthrough.md`](docs/m0-walkthrough.md) (engine),
 |---|---|---|
 | M0 | Engine core: Llama-architecture models (Llama 2/3.x, TinyLlama, SmolLM2, Qwen2), float32 CPU reference backend, CUDA backend (fp16, cuBLAS), paged KV cache, continuous batching with chunked prefill and preemption | done |
 | M1 | CUDA kernels: paged decode attention, flash-style prefill, fused RMSNorm/RoPE, int8 weights | |
-| M2 | KV transfer engine: layer-by-layer streaming during the forward pass, zero-copy TCP and shared-memory transports, recompute fallback under memory pressure | done on CPU; GPU run pending |
+| M2 | KV transfer engine: layer-by-layer streaming during the forward pass, zero-copy TCP and shared-memory transports, recompute fallback under memory pressure | done |
 | M3 | Swift control plane: Swift↔C++ interop, gRPC, OpenAI API, tokenizer | |
 | M4 | Disaggregated scheduling: prefix-cache-aware routing, prefill/decode pools, admission | |
 | M5 | Fault tolerance and deterministic cluster simulation | |
@@ -73,8 +73,20 @@ Measured on the 4-vCPU development container
 | Raw throughput between two processes | shared memory 6-8 GB/s; TCP over loopback 1.7-3.6 GB/s |
 | SmolLM2-135M, 512-token prompt (23.6 MB of KV cache), transfer time left after the prefill forward pass | sent after the pass: 6.5 ms (TCP), 16.9 ms (shm); streamed per layer: 0.05 ms and 0.37 ms, 98-99% hidden |
 
-On CPU the forward pass takes 2.3 s, so the transfer is small next to it either way; the
-GPU run (`scripts/colab_m2.sh`), where prefill is far faster, is the test that matters.
+On a Tesla T4 with the CUDA backend ([`results/t4/m2-2026-10-03.txt`](results/t4/m2-2026-10-03.txt)),
+TinyLlama-1.1B, prefill on one backend and decode on another in one process:
+
+| Prompt | KV cache | Transfer left after prefill: sent afterwards | streamed per layer |
+|---|---|---|---|
+| 512 tokens | 11.5 MB | 6.4 ms (TCP), 15.0 ms (shm) | 0.08 ms, 0.06 ms |
+| 2,048 tokens | 46.1 MB | 21.6 ms (TCP), 56.5 ms (shm) | 0.08 ms, 0.04 ms |
+
+Streaming hides 99-100% of the transfer. The first T4 run hid 1-14% at 0.5 GB/s
+([`results/t4/m2-2026-10-03-first-run.txt`](results/t4/m2-2026-10-03-first-run.txt)): each
+layer was 64 small copies into pageable memory, which cannot overlap kernels. A gather
+kernel and one copy per layer into page-locked memory fixed it. The forward pass times are
+M0's attention kernel, which M1 replaces; a faster prefill leaves less time to hide the
+transfer in, so these numbers will be re-measured after M1.
 
 ## Build and test
 

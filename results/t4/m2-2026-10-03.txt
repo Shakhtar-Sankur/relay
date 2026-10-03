@@ -1,0 +1,52 @@
+# scripts/colab_m2.sh on Colab, Tesla T4 (driver 580.178.04), 4 vCPU, relay commit 56fea48
+== tests on the cuda backend
+test_safetensors: ok  (4 tests, 0 failed)
+test_sampler: ok  (4 tests, 0 failed)
+test_kv_cache: ok  (5 tests, 0 failed)
+test_reference: ok  (2 tests, 0 failed)
+test_batching: ok  (5 tests, 0 failed)
+test_transfer: ok  (9 tests, 0 failed)
+      41 frames, 44544 KV bytes, 8 requests
+      decode side: 3 transfers fell back to recompute, 0 preemptions
+(cpu backend on the same machine: all passed)
+== raw transport speed
+transport tcp, sender and receiver in separate processes
+   message   messages       GB/s
+        4K     262144       0.59
+       64K      16384       3.41
+     1024K       1024       4.79
+    16384K         64       4.71
+transport shm, sender and receiver in separate processes
+   message   messages       GB/s
+        4K     262144       4.46
+       64K      16384       6.25
+     1024K       1024       5.90
+    16384K         64       4.68
+== layer streaming vs sending after the forward pass (CUDA backend)
+model models/tinyllama-1.1b, cuda backend, tcp transport, 512-token prompt, 22 layers, 11.53 MB of KV cache
+                          forward      ready    exposed
+send after forward       261.39ms   267.77ms     6.38ms
+stream layer by layer    258.81ms   258.88ms     0.08ms
+transfer: 11.53 MB; after-forward exposed time is 1.81 GB/s effective
+hidden by streaming: 99% of the exposed transfer time
+
+model models/tinyllama-1.1b, cuda backend, shm transport, 512-token prompt, 22 layers, 11.53 MB of KV cache
+                          forward      ready    exposed
+send after forward       262.29ms   277.34ms    15.04ms
+stream layer by layer    261.43ms   261.49ms     0.06ms
+transfer: 11.53 MB; after-forward exposed time is 0.77 GB/s effective
+hidden by streaming: 100% of the exposed transfer time
+
+model models/tinyllama-1.1b, cuda backend, tcp transport, 2048-token prompt, 22 layers, 46.14 MB of KV cache
+                          forward      ready    exposed
+send after forward      3975.89ms  3997.53ms    21.64ms
+stream layer by layer   3909.91ms  3909.99ms     0.08ms
+transfer: 46.14 MB; after-forward exposed time is 2.13 GB/s effective
+hidden by streaming: 100% of the exposed transfer time
+
+model models/tinyllama-1.1b, cuda backend, shm transport, 2048-token prompt, 22 layers, 46.14 MB of KV cache
+                          forward      ready    exposed
+send after forward      4143.46ms  4199.91ms    56.46ms
+stream layer by layer   4095.34ms  4095.38ms     0.04ms
+transfer: 46.14 MB; after-forward exposed time is 0.82 GB/s effective
+hidden by streaming: 100% of the exposed transfer time
