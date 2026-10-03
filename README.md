@@ -20,7 +20,8 @@ CUDA, written from scratch.
 Why and how: [`docs/design.md`](docs/design.md). Code walkthrough with interview
 questions: [`docs/m0-walkthrough.md`](docs/m0-walkthrough.md) (engine),
 [`docs/m2-walkthrough.md`](docs/m2-walkthrough.md) (KV transfer),
-[`docs/m3-walkthrough.md`](docs/m3-walkthrough.md) (Swift control plane).
+[`docs/m3-walkthrough.md`](docs/m3-walkthrough.md) (Swift control plane),
+[`docs/m4-walkthrough.md`](docs/m4-walkthrough.md) (cluster).
 
 ## Status
 
@@ -30,7 +31,7 @@ questions: [`docs/m0-walkthrough.md`](docs/m0-walkthrough.md) (engine),
 | M1 | CUDA kernels: paged decode attention, flash-style prefill, fused RMSNorm/RoPE, int8 weights | |
 | M2 | KV transfer engine: layer-by-layer streaming during the forward pass, zero-copy TCP and shared-memory transports, recompute fallback under memory pressure | done |
 | M3 | Swift control plane: Swift↔C++ interop, a tokenizer matching Hugging Face, chat templates, an OpenAI-compatible HTTP API with streaming | done (in-process engine; remote workers in M4) |
-| M4 | Disaggregated scheduling: prefix-cache-aware routing, prefill/decode pools, admission | |
+| M4 | The cluster: `relay-worker` processes (prefill, decode, colocated) behind the Swift control plane; prefix caching; prefix-aware routing (rendezvous hashing with a load guard), memory-aware decode placement, admission control | done |
 | M5 | Fault tolerance and deterministic cluster simulation | |
 | M6 | Benchmarks on 2-4 GPUs against colocated serving and vLLM | |
 
@@ -104,6 +105,26 @@ chat templates render exactly as `apply_chat_template`. On the real SmolLM2-135M
 `/v1/completions` returns transformers' greedy continuation word for word. Tests cover
 streaming, stop strings (never leaked, request cancelled in the engine), concurrent requests
 and clients hanging up. Walkthrough: [`docs/m3-walkthrough.md`](docs/m3-walkthrough.md).
+
+## The cluster (M4)
+
+```bash
+cmake -S . -B build -G Ninja && cmake --build build      # relay-worker (add -DRELAY_CUDA=ON for GPUs)
+swift build -c release                                   # relay-server
+scripts/cluster.sh path/to/model disaggregated 1 2       # 1 prefill + 2 decode workers + API on :8000
+scripts/cluster.sh path/to/model colocated 2             # 2 workers doing both
+python scripts/loadgen.py --url http://127.0.0.1:8000 --requests 64 --concurrency 8
+```
+
+Each worker is a process serving the control plane over TCP. A prefill worker samples the
+first token and streams the KV cache to the decode worker the router chose; that worker
+generates the rest. Requests sharing a prefix go to the same prefill worker (rendezvous
+hashing on the first KV block, unless that worker is busier than the others by a margin),
+whose prefix cache then serves it; decode goes where KV memory is free; beyond a limit of
+requests in flight the API answers 503. Tested end to end with real worker processes: the
+disaggregated and colocated clusters reproduce transformers' output, concurrent requests,
+cache hits for shared system prompts, cancellation freeing memory on every worker.
+Walkthrough: [`docs/m4-walkthrough.md`](docs/m4-walkthrough.md).
 
 ## Build and test
 

@@ -9,6 +9,7 @@ let package = Package(
   platforms: [.macOS(.v15)],
   products: [
     .executable(name: "relay-server", targets: ["relay-server"]),
+    .executable(name: "relay-worker", targets: ["relay-worker"]),
     .library(name: "RelayControl", targets: ["RelayControl"]),
   ],
   targets: [
@@ -26,6 +27,15 @@ let package = Package(
       path: "bridge",
       sources: ["src"],
       publicHeadersPath: "include",
+      cxxSettings: [.unsafeFlags(["-O2"])]
+    ),
+    // The worker process, the same source as CMake's relay-worker (CPU backend here).
+    .executableTarget(
+      name: "relay-worker",
+      dependencies: ["RelayEngine"],
+      path: "tools",
+      exclude: ["relay_generate.cpp", "relay_transfer_bench.cpp"],
+      sources: ["relay_worker.cpp"],
       cxxSettings: [.unsafeFlags(["-O2"])]
     ),
     .target(name: "RelayTokenizer", path: "control/Sources/RelayTokenizer"),
@@ -48,7 +58,7 @@ let package = Package(
     ),
     .testTarget(
       name: "RelayControlTests",
-      dependencies: ["RelayControl"],
+      dependencies: ["RelayControl", "relay-worker"],
       path: "control/Tests/RelayControlTests",
       swiftSettings: [.interoperabilityMode(.Cxx)]
     ),

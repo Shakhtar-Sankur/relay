@@ -25,16 +25,21 @@ public enum HTTPServerError: Error {
 public final class ResponseWriter: @unchecked Sendable {
   let fd: Int32
   private let lock = NSLock()
-  private var started = false
+  private var _started = false
   public private(set) var closedByPeer = false
+  public var started: Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return _started
+  }
 
   init(fd: Int32) { self.fd = fd }
 
   public func start(status: Int, headers: [(String, String)]) {
     lock.lock()
     defer { lock.unlock() }
-    guard !started else { return }
-    started = true
+    guard !_started else { return }
+    _started = true
     var head = "HTTP/1.1 \(status) \(ResponseWriter.reason(status))\r\n"
     for (k, v) in headers { head += "\(k): \(v)\r\n" }
     head += "Connection: close\r\n\r\n"

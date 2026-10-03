@@ -2,9 +2,12 @@
 //
 //   relay-server --model DIR [--host 127.0.0.1] [--port 8000] [--blocks 512] [--block-size 16]
 //                [--max-batch-tokens 512]
+//       runs the engine in this process (CPU)
 //
-// This runs the engine in this process (CPU). For prefill and decode on separate worker
-// processes, see relay-cluster.
+//   relay-server --model DIR --workers prefill=H:P,decode=H:P,... [--max-in-flight 256]
+//       fronts a cluster of relay-worker processes (role=both workers for colocated
+//       serving; prefill and decode workers for disaggregated serving). The model directory
+//       is still read here for the tokenizer and chat template.
 import Foundation
 import RelayControl
 
@@ -27,17 +30,29 @@ guard let model = options["model"] else { usage() }
 
 do {
   let bundle = try ModelBundle(directory: URL(fileURLWithPath: model))
-  let engine = try LocalEngine(modelDirectory: model, blocks: Int(options["blocks"] ?? "512") ?? 512,
-                               blockSize: Int(options["block-size"] ?? "16") ?? 16,
-                               maxBatchTokens: Int(options["max-batch-tokens"] ?? "512") ?? 512)
-  let api = OpenAIServer(bundle: bundle, backend: engine)
+  let backend: GenerationBackend
+  let description: String
+  if let spec = options["workers"] {
+    let addresses = spec.split(separator: ",").map { WorkerAddress(String($0)) }
+    guard addresses.allSatisfy({ $0 != nil }) else { usage() }
+    let cluster = try Cluster(addresses: addresses.compactMap { $0 }, maxInFlight: Int(options["max-in-flight"] ?? "256") ?? 256)
+    backend = cluster
+    description = "\(cluster.disaggregated ? "disaggregated" : "colocated") cluster of \(addresses.count) workers"
+  } else {
+    let engine = try LocalEngine(modelDirectory: model, blocks: Int(options["blocks"] ?? "512") ?? 512,
+                                 blockSize: Int(options["block-size"] ?? "16") ?? 16,
+                                 maxBatchTokens: Int(options["max-batch-tokens"] ?? "512") ?? 512)
+    backend = engine
+    description = "in-process engine, \(engine.layers) layers"
+  }
+  let api = OpenAIServer(bundle: bundle, backend: backend)
   let host = options["host"] ?? "127.0.0.1"
   let server = try HTTPServer(host: host, port: Int(options["port"] ?? "8000") ?? 8000) { req, w in
     await api.handle(req, w)
   }
   server.start()
   // FileHandle writes are unbuffered: the line appears at once, even when piped.
-  FileHandle.standardOutput.write(Data(("relay-server: \(bundle.name) (\(engine.layers) layers, vocab \(engine.vocab)) on http://\(host):\(server.port)\n").utf8))
+  FileHandle.standardOutput.write(Data(("relay-server: \(bundle.name) (\(description)) on http://\(host):\(server.port)\n").utf8))
   while true { sleep(3600) }
 } catch {
   FileHandle.standardError.write(Data("relay-server: \(error)\n".utf8))

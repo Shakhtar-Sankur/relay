@@ -6,9 +6,13 @@
 //
 // Prints one line "relay-worker <role> control=<port> kv=<port>" once it is listening, so a
 // launcher started with port 0 can read the ports it got.
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 
 #include "relay/backend.h"
 #include "relay/worker.h"
@@ -24,6 +28,14 @@ static void usage() {
 }
 
 int main(int argc, char** argv) {
+  // A launcher may start us from a thread that blocks signals (Foundation's Process does),
+  // and the mask is inherited: unblock everything so SIGTERM stops the worker.
+  sigset_t all;
+  sigfillset(&all);
+  sigprocmask(SIG_UNBLOCK, &all, nullptr);
+#ifdef __linux__
+  prctl(PR_SET_PDEATHSIG, SIGTERM);  // and stop when the launcher dies
+#endif
   std::string model, backend = "cpu", role = "both";
   int blocks = 512, block_size = 16, device = 0;
   WorkerOptions o;

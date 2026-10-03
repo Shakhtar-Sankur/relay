@@ -128,6 +128,15 @@ public final class OpenAIServer: Sendable {
     }
   }
 
+  // 503 when the cluster is full or has no worker for the request, 400 when the engine
+  // refused it, 500 otherwise.
+  static func status(for error: Error) -> Int {
+    if error is AdmissionError { return 503 }
+    if case ClusterError.noWorker = error { return 503 }
+    if case GenerationError.rejected = error { return 400 }
+    return 500
+  }
+
   func fail(_ w: ResponseWriter, _ status: Int, _ message: String) {
     w.respondJSON(status: status, APIError(error: .init(message: message, type: status >= 500 ? "server_error" : "invalid_request_error")))
   }
@@ -159,13 +168,22 @@ public final class OpenAIServer: Sendable {
   // Runs one generation, calling `emit` with each new piece of text. Returns the number
   // of tokens generated and why generation ended. `emit` returning false (the client went
   // away) ends the stream, which cancels the request in the engine.
-  func run(_ p: Plan, emit: (String) -> Bool) async throws -> (tokens: Int, finish: FinishReason) {
+  func run(_ p: Plan, onStart: () -> Bool = { true }, emit: (String) -> Bool) async throws
+    -> (tokens: Int, finish: FinishReason)
+  {
+    var started = false
     var decoder = StreamingDecoder(bundle.tokenizer)
     var held = ""
     var count = 0
     var finish = FinishReason.length
     let longestStop = p.stops.map(\.count).max() ?? 0
     loop: for try await t in backend.generate(prompt: p.prompt, sampling: p.sampling) {
+      // Headers go out with the first token, so an error before it (overload, a refused
+      // request) can still be a proper HTTP status.
+      if !started {
+        started = true
+        if !onStart() { break }
+      }
       count += 1
       if bundle.stopTokenIDs.contains(t.token) && !p.sampling.ignoreEOS {
         finish = .stop
@@ -201,6 +219,7 @@ public final class OpenAIServer: Sendable {
         break
       }
     }
+    if !started { _ = onStart() }
     if !held.isEmpty { _ = emit(held) }
     return (count, finish)
   }
@@ -236,8 +255,7 @@ public final class OpenAIServer: Sendable {
     let id = OpenAIServer.newID("cmpl-"), created = OpenAIServer.now()
     do {
       if p.stream {
-        startStream(w)
-        let result = try await run(p) { text in
+        let result = try await run(p, onStart: { startStream(w); return true }) { text in
           sse(w, CompletionResponse(id: id, object: "text_completion", created: created, model: bundle.name,
                                     choices: [CompletionChoice(index: 0, text: text, finish_reason: nil)]))
         }
@@ -255,7 +273,11 @@ public final class OpenAIServer: Sendable {
                                                       total_tokens: p.prompt.count + result.tokens)))
       }
     } catch {
-      if p.stream { _ = sse(w, APIError(error: .init(message: "\(error)", type: "server_error"))) } else { fail(w, 500, "\(error)") }
+      if w.started {
+        _ = sse(w, APIError(error: .init(message: "\(error)", type: "server_error")))
+      } else {
+        fail(w, OpenAIServer.status(for: error), "\(error)")
+      }
     }
   }
 
@@ -280,9 +302,10 @@ public final class OpenAIServer: Sendable {
     }
     do {
       if p.stream {
-        startStream(w)
-        guard sse(w, chunk(ChatDelta(role: "assistant", content: ""), nil)) else { return }
-        let result = try await run(p) { text in sse(w, chunk(ChatDelta(role: nil, content: text), nil)) }
+        let result = try await run(p, onStart: {
+          startStream(w)
+          return sse(w, chunk(ChatDelta(role: "assistant", content: ""), nil))
+        }) { text in sse(w, chunk(ChatDelta(role: nil, content: text), nil)) }
         _ = sse(w, chunk(ChatDelta(role: nil, content: nil), result.finish.rawValue,
                          Usage(prompt_tokens: p.prompt.count, completion_tokens: result.tokens,
                                total_tokens: p.prompt.count + result.tokens)))
@@ -297,7 +320,11 @@ public final class OpenAIServer: Sendable {
                                                 total_tokens: p.prompt.count + result.tokens)))
       }
     } catch {
-      if p.stream { _ = sse(w, APIError(error: .init(message: "\(error)", type: "server_error"))) } else { fail(w, 500, "\(error)") }
+      if w.started {
+        _ = sse(w, APIError(error: .init(message: "\(error)", type: "server_error")))
+      } else {
+        fail(w, OpenAIServer.status(for: error), "\(error)")
+      }
     }
   }
 }
