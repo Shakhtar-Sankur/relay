@@ -53,7 +53,7 @@ add_executable(relay-transfer-bench tools/relay_transfer_bench.cpp)
 target_link_libraries(relay-transfer-bench PRIVATE relay_engine)
 
 enable_testing()
-foreach(t safetensors kv_cache reference batching sampler transfer worker)
+foreach(t safetensors kv_cache reference batching sampler transfer worker faults)
   add_executable(test_${t} tests/test_${t}.cpp)
   target_link_libraries(test_${t} PRIVATE relay_engine)
   target_compile_definitions(test_${t} PRIVATE RELAY_FIXTURES="${CMAKE_SOURCE_DIR}/tests/fixtures")

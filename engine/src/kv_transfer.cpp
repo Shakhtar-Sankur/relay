@@ -48,10 +48,19 @@ KVSender::~KVSender() {
 void KVSender::push(Job j) {
   {
     std::lock_guard<std::mutex> lock(mu_);
-    if (error_) std::rethrow_exception(error_);
-    queue_.push_back(std::move(j));
+    if (!error_) {
+      queue_.push_back(std::move(j));
+      cv_.notify_one();
+      return;
+    }
   }
-  cv_.notify_one();
+  // The connection is gone: the frame is dropped, and its owner hears so at once.
+  if (j.on_sent) j.on_sent(false);
+}
+
+bool KVSender::failed() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return error_ != nullptr;
 }
 
 void KVSender::begin(const Request& r, int num_blocks) {
@@ -71,13 +80,13 @@ void KVSender::layer(std::uint64_t request, int layer, int first_index, std::vec
   push(std::move(j));
 }
 
-void KVSender::end(std::uint64_t request, int first_token, bool finished, std::function<void()> on_sent) {
+void KVSender::end(std::uint64_t request, int first_token, bool finished, std::function<void(bool)> on_sent) {
   Job j{FrameType::End, request, first_token, finished ? 1 : 0};
   j.on_sent = std::move(on_sent);
   push(std::move(j));
 }
 
-void KVSender::abort(std::uint64_t request, std::function<void()> on_sent) {
+void KVSender::abort(std::uint64_t request, std::function<void(bool)> on_sent) {
   Job j{FrameType::Abort, request};
   j.on_sent = std::move(on_sent);
   push(std::move(j));
@@ -85,7 +94,8 @@ void KVSender::abort(std::uint64_t request, std::function<void()> on_sent) {
 
 void KVSender::flush() {
   std::unique_lock<std::mutex> lock(mu_);
-  idle_cv_.wait(lock, [this] { return (queue_.empty() && !busy_) || error_; });
+  // After a failure, busy_ stays set until every dropped frame's callback has run.
+  idle_cv_.wait(lock, [this] { return !busy_ && (queue_.empty() || error_); });
   if (error_) std::rethrow_exception(error_);
 }
 
@@ -138,18 +148,24 @@ void KVSender::run() {
         Slice s[2] = {{&h, sizeof h}, {j.payload.data(), j.payload.size()}};
         conn_.send(s, 2);
       }
-      if (j.on_sent) j.on_sent();
+      if (j.on_sent) j.on_sent(true);
       std::lock_guard<std::mutex> lock(mu_);
       ++stats_.frames;
       if (j.type == FrameType::End) ++stats_.requests;
     } catch (...) {
+      // Everything still queued is dropped; its owners learn which requests did not arrive
+      // (and get their blocks back). The callbacks run without the lock: they take the
+      // prefill worker's.
+      std::deque<Job> dropped;
+      {
+        std::lock_guard<std::mutex> lock(mu_);
+        error_ = std::current_exception();
+        dropped.swap(queue_);
+      }
+      if (j.on_sent) j.on_sent(false);
+      for (auto& q : dropped)
+        if (q.on_sent) q.on_sent(false);
       std::lock_guard<std::mutex> lock(mu_);
-      error_ = std::current_exception();
-      // Free the blocks of everything still queued so the prefill worker does not leak.
-      if (j.on_sent) j.on_sent();
-      for (auto& q : queue_)
-        if (q.on_sent) q.on_sent();
-      queue_.clear();
       busy_ = false;
       idle_cv_.notify_all();
       return;
@@ -350,7 +366,7 @@ bool PrefillWorker::cancel(std::uint64_t id) {
     // Queued Layer frames may still read the blocks: free them once the Abort is sent.
     auto blocks = std::make_shared<std::vector<int>>(std::move(it->blocks));
     if (it->begun) {
-      it->sender->abort(id, [this, blocks] {
+      it->sender->abort(id, [this, blocks](bool) {
         std::lock_guard<std::mutex> lock(alloc_mu_);
         alloc_.release_all(*blocks);
       });
@@ -364,6 +380,30 @@ bool PrefillWorker::cancel(std::uint64_t id) {
   return false;
 }
 
+void PrefillWorker::cancel_all() {
+  while (!queue_.empty()) cancel(queue_.front().req.id);
+}
+
+void PrefillWorker::drop_sender(const KVSender* sender) {
+  for (auto it = queue_.begin(); it != queue_.end();) {
+    if (it->sender != sender) {
+      ++it;
+      continue;
+    }
+    std::lock_guard<std::mutex> lock(alloc_mu_);
+    alloc_.release_all(it->blocks);
+    failed_.push_back(it->req.id);
+    it = queue_.erase(it);
+  }
+}
+
+std::vector<std::uint64_t> PrefillWorker::take_failed() {
+  std::lock_guard<std::mutex> lock(alloc_mu_);
+  std::vector<std::uint64_t> out;
+  out.swap(failed_);
+  return out;
+}
+
 bool PrefillWorker::has_work() const { return !queue_.empty(); }
 
 int PrefillWorker::free_blocks() const {
@@ -373,6 +413,18 @@ int PrefillWorker::free_blocks() const {
 
 std::vector<TokenEvent> PrefillWorker::step() {
   const KVLayout& kv = be_.kv_layout();
+  // Requests headed to a decode worker whose connection failed cannot be delivered: drop
+  // them (the sender's thread has stopped, so nothing reads their blocks any more).
+  for (auto it = queue_.begin(); it != queue_.end();) {
+    if (it->done || !it->sender->failed()) {
+      ++it;
+      continue;
+    }
+    std::lock_guard<std::mutex> lock(alloc_mu_);
+    alloc_.release_all(it->blocks);
+    failed_.push_back(it->req.id);
+    it = queue_.erase(it);
+  }
   ForwardBatch batch;
   struct Member {
     Pending* p;
@@ -455,9 +507,12 @@ std::vector<TokenEvent> PrefillWorker::step() {
     // The blocks go back to the pool only once the sender has sent every frame that
     // reads them.
     auto blocks = std::make_shared<std::vector<int>>(std::move(p->blocks));
-    p->sender->end(p->req.id, tok, finished, [this, blocks] {
+    const std::uint64_t id = p->req.id;
+    p->sender->end(id, tok, finished, [this, blocks, id, finished](bool sent) {
       std::lock_guard<std::mutex> lock(alloc_mu_);
       alloc_.release_all(*blocks);
+      // A request that ended at its first token needs nothing from the decode worker.
+      if (!sent && !finished) failed_.push_back(id);
     });
     p->done = true;
   }

@@ -89,6 +89,14 @@ bool Engine::cancel(std::uint64_t id) {
   return false;
 }
 
+void Engine::cancel_all() {
+  std::lock_guard<std::mutex> lock(mu_);
+  for (auto& s : waiting_) alloc_.release_all(s->blocks);
+  for (auto& s : running_) alloc_.release_all(s->blocks);
+  waiting_.clear();
+  running_.clear();
+}
+
 void Engine::release_blocks(std::vector<int>& blocks) {
   std::lock_guard<std::mutex> lock(mu_);
   alloc_.release_all(blocks);

@@ -2,7 +2,9 @@
 //
 //   relay-worker --model DIR --role both|prefill|decode [--backend cpu|cuda] [--device 0]
 //                [--host 127.0.0.1] [--control-port 0] [--kv-port 0] [--blocks 512]
-//                [--block-size 16] [--batch-tokens 512] [--no-prefix-cache]
+//                [--block-size 16] [--batch-tokens 512] [--no-prefix-cache] [--step-delay-ms N]
+//
+// --step-delay-ms is a testing aid: it slows every step so a fault can land mid-request.
 //
 // Prints one line "relay-worker <role> control=<port> kv=<port>" once it is listening, so a
 // launcher started with port 0 can read the ports it got.
@@ -10,9 +12,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
-#ifdef __linux__
-#include <sys/prctl.h>
-#endif
+#include <chrono>
+#include <thread>
+#include <unistd.h>
 
 #include "relay/backend.h"
 #include "relay/worker.h"
@@ -23,7 +25,7 @@ static void usage() {
   std::fprintf(stderr,
                "usage: relay-worker --model DIR --role both|prefill|decode [--backend cpu|cuda] [--device N]\n"
                "       [--host H] [--control-port P] [--kv-port P] [--blocks N] [--block-size N] [--batch-tokens N]\n"
-               "       [--no-prefix-cache]\n");
+               "       [--no-prefix-cache] [--step-delay-ms N]\n");
   std::exit(2);
 }
 
@@ -33,9 +35,16 @@ int main(int argc, char** argv) {
   sigset_t all;
   sigfillset(&all);
   sigprocmask(SIG_UNBLOCK, &all, nullptr);
-#ifdef __linux__
-  prctl(PR_SET_PDEATHSIG, SIGTERM);  // and stop when the launcher dies
-#endif
+  // Stop when the launcher's process exits. (Not PR_SET_PDEATHSIG: that fires when the
+  // launching *thread* exits, so a launcher that starts workers from a short-lived thread,
+  // as a chaos script restarting them does, would take them down with it.)
+  {
+    const pid_t parent = getppid();
+    std::thread([parent] {
+      while (getppid() == parent) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      std::_Exit(0);
+    }).detach();
+  }
   std::string model, backend = "cpu", role = "both";
   int blocks = 512, block_size = 16, device = 0;
   WorkerOptions o;
@@ -56,6 +65,7 @@ int main(int argc, char** argv) {
     else if (a == "--block-size") block_size = std::stoi(next());
     else if (a == "--batch-tokens") o.max_batch_tokens = std::stoi(next());
     else if (a == "--no-prefix-cache") o.prefix_caching = false;
+    else if (a == "--step-delay-ms") o.step_delay_ms = std::stoi(next());
     else usage();
   }
   if (model.empty()) usage();

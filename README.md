@@ -21,7 +21,8 @@ Why and how: [`docs/design.md`](docs/design.md). Code walkthrough with interview
 questions: [`docs/m0-walkthrough.md`](docs/m0-walkthrough.md) (engine),
 [`docs/m2-walkthrough.md`](docs/m2-walkthrough.md) (KV transfer),
 [`docs/m3-walkthrough.md`](docs/m3-walkthrough.md) (Swift control plane),
-[`docs/m4-walkthrough.md`](docs/m4-walkthrough.md) (cluster).
+[`docs/m4-walkthrough.md`](docs/m4-walkthrough.md) (cluster),
+[`docs/m5-walkthrough.md`](docs/m5-walkthrough.md) (fault tolerance).
 
 ## Status
 
@@ -32,7 +33,7 @@ questions: [`docs/m0-walkthrough.md`](docs/m0-walkthrough.md) (engine),
 | M2 | KV transfer engine: layer-by-layer streaming during the forward pass, zero-copy TCP and shared-memory transports, recompute fallback under memory pressure | done |
 | M3 | Swift control plane: Swift↔C++ interop, a tokenizer matching Hugging Face, chat templates, an OpenAI-compatible HTTP API with streaming | done (in-process engine; remote workers in M4) |
 | M4 | The cluster: `relay-worker` processes (prefill, decode, colocated) behind the Swift control plane; prefix caching; prefix-aware routing (rendezvous hashing with a load guard), memory-aware decode placement, admission control | done |
-| M5 | Fault tolerance and deterministic cluster simulation | |
+| M5 | Fault tolerance: lost workers (killed, frozen, stalled) detected by connection, heartbeat and progress watchdogs; their requests resumed elsewhere with identical output; workers rejoin; seeded fault injection of the KV transfer | done |
 | M6 | Benchmarks on 2-4 GPUs against colocated serving and vLLM | |
 
 ## Correctness so far
@@ -126,6 +127,35 @@ disaggregated and colocated clusters reproduce transformers' output, concurrent 
 cache hits for shared system prompts, cancellation freeing memory on every worker.
 Walkthrough: [`docs/m4-walkthrough.md`](docs/m4-walkthrough.md).
 
+## Fault tolerance (M5)
+
+A worker can die, freeze or come back at any moment. The control plane notices (closed
+connection, 2 s of silence, or 30 s without progress while it holds requests) and places each
+of its requests again from where it stands: no token yet, a fresh prefill; some tokens, a
+decode worker resumes it from the prompt and the tokens so far. Sampling depends only on
+(seed, token index), so the client's stream carries on with exactly the tokens it would have
+had, each once, in order. Workers that come back rejoin; while every worker of a role is
+down, requests wait for one rather than fail.
+
+- Seeded fault injection of the KV transfer (300 seeds + a sweep of 99 cut points, the
+  connection broken anywhere, mid-frame included): every request is delivered exactly or
+  reported for retry, and no KV block leaks on either side.
+- Real `relay-worker` processes killed (SIGKILL), frozen (SIGSTOP) and stalled under live
+  requests, and a seeded chaos test (24 concurrent requests, 8 kills and restarts): every
+  output identical to a fault-free run.
+- `scripts/chaos.py` runs a real cluster (worker processes + the Swift API server) serving
+  SmolLM2-135M and SIGKILLs workers at random while 64 requests stream through it, then
+  restarts them in place. Over 3 seeds and both cluster shapes (2 prefill + 2 decode; 3
+  colocated): 384 of 384 outputs identical to a fault-free run through 60 kills, none failed;
+  each 64-request run took 58-66 s instead of 46-53 s. Raw output:
+  [`results/cpu/m5-chaos-2026-10-03.txt`](results/cpu/m5-chaos-2026-10-03.txt).
+
+The tests found three bugs on the way, two of them already in M4: tokens from two workers
+could overtake each other on the way to the client, and a worker restarted from a launcher's
+thread was killed when that thread ended (`PR_SET_PDEATHSIG` follows the thread, not the
+process). See the walkthrough:
+[`docs/m5-walkthrough.md`](docs/m5-walkthrough.md).
+
 ## Build and test
 
 ```bash
@@ -153,6 +183,6 @@ engine/include/relay/   public headers: config, safetensors, weights, kv_cache, 
 engine/src/             CPU backend, CUDA backend (cuda_backend.cu), engine, loaders
 tools/relay_generate.cpp
 tests/                  C++ tests; tests/fixtures holds tiny models and their transformers outputs
-scripts/                fixture generation, Colab GPU script
+scripts/                fixture generation, Colab GPU scripts, cluster launcher, load generator, chaos run
 docs/                   design and walkthroughs
 ```

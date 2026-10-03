@@ -5,6 +5,7 @@
 //       runs the engine in this process (CPU)
 //
 //   relay-server --model DIR --workers prefill=H:P,decode=H:P,... [--max-in-flight 256]
+//                [--heartbeat-timeout 2] [--stall-timeout 30]
 //       fronts a cluster of relay-worker processes (role=both workers for colocated
 //       serving; prefill and decode workers for disaggregated serving). The model directory
 //       is still read here for the tokenizer and chat template.
@@ -35,7 +36,11 @@ do {
   if let spec = options["workers"] {
     let addresses = spec.split(separator: ",").map { WorkerAddress(String($0)) }
     guard addresses.allSatisfy({ $0 != nil }) else { usage() }
-    let cluster = try Cluster(addresses: addresses.compactMap { $0 }, maxInFlight: Int(options["max-in-flight"] ?? "256") ?? 256)
+    var o = ClusterOptions()
+    o.maxInFlight = Int(options["max-in-flight"] ?? "") ?? o.maxInFlight
+    o.heartbeatTimeout = Double(options["heartbeat-timeout"] ?? "") ?? o.heartbeatTimeout
+    o.stallTimeout = Double(options["stall-timeout"] ?? "") ?? o.stallTimeout
+    let cluster = try Cluster(addresses: addresses.compactMap { $0 }, options: o)
     backend = cluster
     description = "\(cluster.disaggregated ? "disaggregated" : "colocated") cluster of \(addresses.count) workers"
   } else {

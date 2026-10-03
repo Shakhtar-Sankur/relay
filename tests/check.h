@@ -77,6 +77,12 @@ inline std::unique_ptr<relay::Backend> make_backend(const relay::HostWeights& w,
 // GEMMs depend on batch shape, so it gets a looser tolerance and no bitwise checks.
 inline bool exact_backend() { return test_backend() == "cpu"; }
 
+// An integer from the environment, or `fallback` (lets slow builds run fewer cases).
+inline int env_int(const char* name, int fallback) {
+  const char* v = std::getenv(name);
+  return v && *v ? std::atoi(v) : fallback;
+}
+
 }  // namespace check
 
 #define TEST(name)                                                  \

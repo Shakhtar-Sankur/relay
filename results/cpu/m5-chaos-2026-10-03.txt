@@ -1,0 +1,40 @@
+# scripts/chaos.py: a real cluster (relay-worker processes + the Swift API server) serving SmolLM2-135M on the CPU
+# backend, run twice per configuration on a fresh cluster each time: without faults, then while workers are
+# SIGKILLed at random and restarted in place. Every output of the chaos run must equal the fault-free run's.
+# Machine: 4 CPU cores. Sampled (temperature 0.8, a fixed seed per request), streaming, 8 requests at a time.
+
+$ python scripts/chaos.py --model models/smollm2-135m --prefill 2 --decode 2 --requests 64 --kills 10 --concurrency 8 --max-tokens 48 --seed 0
+model smollm2-135m, 4 workers (2 decode, 2 prefill, 1 threads each), 64 requests (2334 tokens), 8 at a time, CPU
+fault-free run: 47.7 s
+chaos run:      58.0 s, 10 workers killed with SIGKILL and restarted (3 decode, 7 prefill)
+identical outputs: 64 of 64; failed requests: 0
+
+$ python scripts/chaos.py --model models/smollm2-135m --prefill 0 --decode 3 --requests 64 --kills 10 --concurrency 8 --max-tokens 48 --seed 0
+model smollm2-135m, 3 workers (3 both, 1 threads each), 64 requests (2334 tokens), 8 at a time, CPU
+fault-free run: 53.3 s
+chaos run:      65.6 s, 10 workers killed with SIGKILL and restarted (10 both)
+identical outputs: 64 of 64; failed requests: 0
+
+$ python scripts/chaos.py --model models/smollm2-135m --prefill 2 --decode 2 --requests 64 --kills 10 --concurrency 8 --max-tokens 48 --seed 1
+model smollm2-135m, 4 workers (2 decode, 2 prefill, 1 threads each), 64 requests (2367 tokens), 8 at a time, CPU
+fault-free run: 47.4 s
+chaos run:      64.6 s, 10 workers killed with SIGKILL and restarted (6 decode, 4 prefill)
+identical outputs: 64 of 64; failed requests: 0
+
+$ python scripts/chaos.py --model models/smollm2-135m --prefill 0 --decode 3 --requests 64 --kills 10 --concurrency 8 --max-tokens 48 --seed 1
+model smollm2-135m, 3 workers (3 both, 1 threads each), 64 requests (2367 tokens), 8 at a time, CPU
+fault-free run: 52.0 s
+chaos run:      65.1 s, 10 workers killed with SIGKILL and restarted (10 both)
+identical outputs: 64 of 64; failed requests: 0
+
+$ python scripts/chaos.py --model models/smollm2-135m --prefill 2 --decode 2 --requests 64 --kills 10 --concurrency 8 --max-tokens 48 --seed 2
+model smollm2-135m, 4 workers (2 decode, 2 prefill, 1 threads each), 64 requests (2246 tokens), 8 at a time, CPU
+fault-free run: 45.7 s
+chaos run:      58.0 s, 10 workers killed with SIGKILL and restarted (5 decode, 5 prefill)
+identical outputs: 64 of 64; failed requests: 0
+
+$ python scripts/chaos.py --model models/smollm2-135m --prefill 0 --decode 3 --requests 64 --kills 10 --concurrency 8 --max-tokens 48 --seed 2
+model smollm2-135m, 3 workers (3 both, 1 threads each), 64 requests (2246 tokens), 8 at a time, CPU
+fault-free run: 49.4 s
+chaos run:      61.0 s, 10 workers killed with SIGKILL and restarted (10 both)
+identical outputs: 64 of 64; failed requests: 0

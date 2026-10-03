@@ -53,16 +53,34 @@ import Testing
   #expect(r.chooseDecode(workers: []) == nil)
 }
 
+// The watchdog reads the clock, then a reader thread stamps a newer heartbeat: the
+// difference must be 0, not an unsigned wrap to 584 years (a bug the chaos test found).
+@Test func heartbeatAgeNeverWraps() {
+  #expect(secondsSince(1_000, now: 3_000_000_000) == 2.999999)
+  #expect(secondsSince(5_000, now: 4_000) == 0)
+}
+
 // ---- worker processes -----------------------------------------------------------
 
 final class WorkerProcess: @unchecked Sendable {
   let process = Process()
   let address: WorkerAddress
 
-  init(role: WorkerRoleName, model: URL = chatTiny, blocks: Int = 128) throws {
+  let role: WorkerRoleName
+  let stepDelayMs: Int
+
+  // controlPort 0: any free port; give the old one to restart a worker in its place.
+  init(role: WorkerRoleName, model: URL = chatTiny, blocks: Int = 128, controlPort: Int = 0, stepDelayMs: Int = 0) throws {
+    self.role = role
+    self.stepDelayMs = stepDelayMs
     let bin = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent().appendingPathComponent("relay-worker")
     process.executableURL = bin
-    process.arguments = ["--model", model.path, "--role", role.rawValue, "--blocks", "\(blocks)", "--block-size", "16"]
+    process.arguments = ["--model", model.path, "--role", role.rawValue, "--blocks", "\(blocks)", "--block-size", "16",
+                         "--control-port", "\(controlPort)", "--step-delay-ms", "\(stepDelayMs)"]
+    // Extra worker flags for experiments, e.g. RELAY_TEST_WORKER_ARGS="--no-prefix-cache".
+    if let extra = ProcessInfo.processInfo.environment["RELAY_TEST_WORKER_ARGS"] {
+      process.arguments! += extra.split(separator: " ").map(String.init)
+    }
     let out = Pipe()
     process.standardOutput = out
     process.standardError = FileHandle.standardError
@@ -79,6 +97,13 @@ final class WorkerProcess: @unchecked Sendable {
       throw ClusterError.connect("unexpected worker output: \(text)")
     }
     address = WorkerAddress(role: role, host: "127.0.0.1", port: port)
+  }
+
+  func signal(_ sig: Int32) { Glibc.kill(process.processIdentifier, sig) }
+
+  // A new process in this one's place (same role and control port), once this one is gone.
+  func restart() throws -> WorkerProcess {
+    try WorkerProcess(role: role, controlPort: address.port, stepDelayMs: stepDelayMs)
   }
 
   // Not waitUntilExit(): off the main thread on Linux it spins a run loop at 100% CPU.
@@ -173,11 +198,18 @@ let greedy = #"{"messages":[{"role":"system","content":"Be brief."},{"role":"use
       return all
     }
     #expect(results.count == 16 && results.allSatisfy { $0 == want })
+    for r in results where r != want { print("MISMATCH got \(r.debugDescription) want \(want.debugDescription)") }
     #expect(f.waitAllFree())
     // Tokens 2..8 of every request were decoded on the decode workers. (Which decode worker
     // got each request depends on timing; the router's balancing is unit-tested above.)
-    let s = f.cluster.stats()
-    #expect(s.workers.filter { $0.role == "decode" }.map(\.forwardTokens).reduce(0, +) >= 16 * 7)
+    // (Load reports arrive every 20 ms: wait for the one that counts the last step.)
+    var decoded: UInt64 = 0
+    for _ in 0..<500 {
+      decoded = f.cluster.stats().workers.filter { $0.role == "decode" }.map(\.forwardTokens).reduce(0, +)
+      if decoded >= 16 * 7 { break }
+      usleep(10_000)
+    }
+    #expect(decoded >= 16 * 7)
   }
 
   @Test func sharedSystemPromptsHitOnePrefillWorkersCache() async throws {
@@ -189,7 +221,11 @@ let greedy = #"{"messages":[{"role":"system","content":"Be brief."},{"role":"use
       #expect(status == 200)
     }
     #expect(f.waitAllFree())
-    let prefill = f.cluster.stats().workers.filter { $0.role == "prefill" }
+    var prefill = f.cluster.stats().workers.filter { $0.role == "prefill" }
+    for _ in 0..<500 where prefill.map(\.prefixHitTokens).reduce(0, +) < 4 * 16 {  // load reports lag up to 20 ms
+      usleep(10_000)
+      prefill = f.cluster.stats().workers.filter { $0.role == "prefill" }
+    }
     // All five went to the same prefill worker, and four found the system prompt cached.
     #expect(prefill.filter { $0.promptTokens > 0 }.count == 1)
     #expect(prefill.map(\.prefixHitTokens).reduce(0, +) >= 4 * 16)

@@ -98,6 +98,8 @@ class Engine {
   // Drops a request wherever it is (queued or running) and frees its blocks; false if
   // the engine does not have it (already finished, or never added).
   bool cancel(std::uint64_t id);
+  // Drops every request and frees its blocks (a new control plane took over).
+  void cancel_all();
 
   EngineStats stats() const;
   int free_blocks() const;

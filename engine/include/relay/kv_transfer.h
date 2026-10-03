@@ -76,6 +76,11 @@ struct TransferStats {
 };
 
 // Prefill side: queues frames and sends them from its own thread.
+//
+// If the connection breaks, the sender fails: everything queued is dropped, and every
+// later frame is dropped as soon as it is queued. Each End and Abort learns whether it
+// reached the wire through its callback, so the prefill worker can tell the control plane
+// exactly which requests did not arrive. Queueing never throws.
 class KVSender {
  public:
   // on_layer_sent runs on the sender thread after each Layer frame is written:
@@ -88,11 +93,15 @@ class KVSender {
   // number first_index, first_index + 1, ... The blocks must stay allocated until the
   // request's end() callback has run.
   void layer(std::uint64_t request, int layer, int first_index, std::vector<int> blocks);
-  // on_sent runs on the sender thread once every earlier frame of the request is out.
-  void end(std::uint64_t request, int first_token, bool finished, std::function<void()> on_sent);
-  void abort(std::uint64_t request, std::function<void()> on_sent = nullptr);
+  // on_sent(true) runs on the sender thread once the frame and every earlier frame of the
+  // request are out; on_sent(false) runs (on whichever thread finds out) if the connection
+  // failed first. Either way the request's blocks are no longer read after it runs.
+  void end(std::uint64_t request, int first_token, bool finished, std::function<void(bool sent)> on_sent);
+  void abort(std::uint64_t request, std::function<void(bool sent)> on_sent = nullptr);
   // Waits until everything queued so far has been sent; rethrows a send error.
   void flush();
+  // True once the connection has failed; nothing more will be sent.
+  bool failed() const;
 
   TransferStats stats() const;
 
@@ -104,7 +113,7 @@ class KVSender {
     int a = 0, b = 0;
     std::vector<int> blocks;
     std::vector<unsigned char> payload;
-    std::function<void()> on_sent;
+    std::function<void(bool)> on_sent;
   };
   void push(Job j);
   void run();
@@ -184,6 +193,14 @@ class PrefillWorker {
   // when null). A prefill worker can serve several decode workers.
   void add(Request r, KVSender* to = nullptr);
   bool cancel(std::uint64_t id);
+  // Drops every request (a new control plane took over; the old one's requests are gone).
+  void cancel_all();
+  // Drops every request headed to `sender`, which is about to be destroyed; they are
+  // reported by take_failed(). The sender's thread must have stopped.
+  void drop_sender(const KVSender* sender);
+  // Requests whose KV cache did not reach their decode worker (its connection failed),
+  // since the last call. The first token of some of them may already have been reported.
+  std::vector<std::uint64_t> take_failed();
   bool has_work() const;
   std::vector<TokenEvent> step();
   int free_blocks() const;
@@ -210,6 +227,7 @@ class PrefillWorker {
   mutable std::mutex alloc_mu_;  // the sender thread frees blocks
   BlockManager alloc_;
   PrefillStats stats_;
+  std::vector<std::uint64_t> failed_;  // guarded by alloc_mu_ (the sender thread adds to it)
   std::deque<Pending> queue_;
 };
 
