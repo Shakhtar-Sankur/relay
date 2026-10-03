@@ -11,12 +11,15 @@ struct Engine::Seq {
   int generated = 0;
   int computed = 0;         // tokens whose K and V are in the cache
   std::vector<int> blocks;
+  std::vector<std::uint64_t> hashes;  // prefix-cache hashes of the full blocks indexed so far
   std::uint64_t admit_order = 0;
   bool done = false;
 };
 
 Engine::Engine(Backend& backend, EngineOptions options)
-    : backend_(backend), opt_(options), alloc_(backend.kv_layout().num_blocks) {
+    : backend_(backend),
+      opt_(options),
+      alloc_(backend.kv_layout().num_blocks, backend.kv_layout().block_size, options.prefix_caching) {
   if (opt_.max_batch_tokens <= 0 || opt_.max_seqs <= 0) throw std::invalid_argument("bad EngineOptions");
 }
 
@@ -29,12 +32,14 @@ bool Engine::has_work() const {
 
 EngineStats Engine::stats() const {
   std::lock_guard<std::mutex> lock(mu_);
-  return stats_;
+  EngineStats s = stats_;
+  s.cached_blocks = alloc_.num_cached();
+  return s;
 }
 
 int Engine::free_blocks() const {
   std::lock_guard<std::mutex> lock(mu_);
-  return alloc_.num_free();
+  return alloc_.num_available();
 }
 
 bool Engine::reserve_blocks(int n, std::vector<int>& out) {
@@ -45,7 +50,7 @@ bool Engine::reserve_blocks(int n, std::vector<int>& out) {
 bool Engine::try_reserve_for_transfer(int n, std::vector<int>& out) {
   std::lock_guard<std::mutex> lock(mu_);
   if (!waiting_.empty()) return false;
-  if (alloc_.num_free() < n + static_cast<int>(running_.size())) return false;
+  if (alloc_.num_available() < n + static_cast<int>(running_.size())) return false;
   return alloc_.allocate(n, out);
 }
 
@@ -119,7 +124,10 @@ bool Engine::ensure_blocks(Seq& s, int tokens) {
 }
 
 void Engine::preempt(Seq& s) {
+  // Its full blocks stay in the prefix cache (unless evicted), so the recompute is
+  // usually just a lookup.
   alloc_.release_all(s.blocks);
+  s.hashes.clear();
   s.computed = 0;
   ++stats_.preemptions;
   for (auto it = running_.begin(); it != running_.end(); ++it) {
@@ -177,10 +185,27 @@ std::vector<TokenEvent> Engine::step_locked() {
   // 2. Prompt chunks: first requests already part-way through their prompt, then
   //    new ones from the queue, while there is budget and cache room.
   auto add_chunk = [&](Seq* s) -> bool {
+    bool matched_now = false;
+    if (s->computed == 0 && s->blocks.empty()) {
+      // Reuse cached prefix blocks. At least one token is left to compute: its logits
+      // are what the next token is sampled from.
+      s->computed = alloc_.match_prefix(s->tokens, static_cast<int>(s->tokens.size()) - 1, s->blocks, s->hashes);
+      matched_now = true;
+    }
     int pending = static_cast<int>(s->tokens.size()) - s->computed;
     int n = std::min(pending, budget);
-    if (n <= 0) return false;
-    if (!ensure_blocks(*s, s->computed + n)) return false;
+    if (n <= 0 || !ensure_blocks(*s, s->computed + n)) {
+      if (matched_now) {  // not admitted after all: a waiting request holds no blocks
+        alloc_.release_all(s->blocks);
+        s->hashes.clear();
+        s->computed = 0;
+      }
+      return false;
+    }
+    if (matched_now) {
+      stats_.prompt_tokens += s->tokens.size();
+      stats_.prefix_hit_tokens += static_cast<std::uint64_t>(s->computed);
+    }
     std::vector<int> chunk(s->tokens.begin() + s->computed, s->tokens.begin() + s->computed + n);
     batch.seqs.push_back({std::move(chunk), s->computed, s->blocks, s->computed + n == static_cast<int>(s->tokens.size())});
     members.push_back(s);
@@ -217,6 +242,7 @@ std::vector<TokenEvent> Engine::step_locked() {
     Seq* s = members[i];
     s->computed += static_cast<int>(batch.seqs[i].tokens.size());
     stats_.forward_tokens += batch.seqs[i].tokens.size();
+    alloc_.register_full(s->tokens, s->computed, s->blocks, s->hashes);
     if (!batch.seqs[i].want_logits) continue;
     const float* lg = logits.data() + static_cast<std::size_t>(row++) * V;
     if (on_logits) on_logits(s->req.id, s->generated, lg);

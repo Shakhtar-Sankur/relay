@@ -256,6 +256,58 @@ TEST(memory_pressure_on_the_decode_side_changes_nothing) {
   CHECK(rs_stats.recomputed + ds.preemptions > 0);
 }
 
+TEST(prefill_prefix_cache_sends_cached_blocks_and_changes_nothing) {
+  HostWeights w = HostWeights::load(kModel);
+  // Six requests sharing a 37-token prefix, prefilled one after another so later ones hit.
+  std::mt19937 rng(21);
+  std::vector<int> system;
+  for (int i = 0; i < 37; ++i) system.push_back(static_cast<int>(rng() % w.config.vocab));
+  std::vector<Request> rs;
+  for (int i = 0; i < 6; ++i) {
+    Request r;
+    r.id = 900 + i;
+    r.prompt = system;
+    for (int t = 0; t < 2 + i * 3; ++t) r.prompt.push_back(static_cast<int>(rng() % w.config.vocab));
+    r.params.max_new_tokens = 4;
+    r.params.ignore_eos = true;
+    rs.push_back(r);
+  }
+  Log one, two;
+  auto a = colocated(w, rs, one);
+  auto [tx, rx] = tcp_pair();
+  auto pb = check::make_backend(w, 64, 8);
+  auto db = check::make_backend(w, 64, 8);
+  Engine decode(*db, {256, 64});
+  decode.on_logits = [&](std::uint64_t id, int idx, const float* lg) { two[{id, idx}] = {lg, lg + w.config.vocab}; };
+  std::map<std::uint64_t, std::vector<int>> b;
+  PrefillStats ps;
+  {
+    KVReceiver receiver(decode, *db, *rx);
+    KVSender sender(*pb, *tx);
+    PrefillWorker pw(*pb, sender, 512);
+    pw.on_logits = [&](std::uint64_t id, const float* lg) { two[{id, 0}] = {lg, lg + w.config.vocab}; };
+    for (const auto& r : rs) {
+      pw.add(r);
+      while (pw.has_work())
+        for (const TokenEvent& e : pw.step()) b[e.id].push_back(e.token);
+      sender.flush();
+      for (int i = 0; i < 2000 && receiver.stats().requests < (std::uint64_t)(&r - &rs[0] + 1); ++i)
+        std::this_thread::sleep_for(std::chrono::microseconds(500));
+      while (decode.has_work())
+        for (const TokenEvent& e : decode.step()) b[e.id].push_back(e.token);
+    }
+    ps = pw.stats();
+    tx->close();
+    receiver.join();
+  }
+  CHECK(a == b);
+  if (check::exact_backend()) compare(one, two);
+  CHECK(ps.prefix_hit_tokens >= 5u * 32u);
+  std::fprintf(stderr, "  prefill: %llu prompt tokens, %llu from the prefix cache, %llu computed\n",
+               (unsigned long long)ps.prompt_tokens, (unsigned long long)ps.prefix_hit_tokens,
+               (unsigned long long)ps.forward_tokens);
+}
+
 TEST(a_lost_sender_returns_its_blocks) {
   HostWeights w = HostWeights::load(kModel);
   auto pb = check::make_backend(w, 16, 8);

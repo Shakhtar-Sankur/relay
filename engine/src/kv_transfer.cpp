@@ -316,8 +316,16 @@ void KVReceiver::handle(const FrameHeader& h) {
 
 // ---- prefill worker ---------------------------------------------------------
 
-PrefillWorker::PrefillWorker(Backend& backend, KVSender& sender, int max_batch_tokens)
-    : be_(backend), sender_(sender), budget_(max_batch_tokens), alloc_(backend.kv_layout().num_blocks) {}
+PrefillWorker::PrefillWorker(Backend& backend, KVSender& sender, int max_batch_tokens, bool prefix_caching)
+    : be_(backend),
+      sender_(sender),
+      budget_(max_batch_tokens),
+      alloc_(backend.kv_layout().num_blocks, backend.kv_layout().block_size, prefix_caching) {}
+
+PrefillStats PrefillWorker::stats() const {
+  std::lock_guard<std::mutex> lock(alloc_mu_);
+  return stats_;
+}
 
 void PrefillWorker::add(Request r) {
   if (r.prompt.empty()) throw std::invalid_argument("empty prompt");
@@ -330,7 +338,7 @@ bool PrefillWorker::has_work() const { return !queue_.empty(); }
 
 int PrefillWorker::free_blocks() const {
   std::lock_guard<std::mutex> lock(alloc_mu_);
-  return alloc_.num_free();
+  return alloc_.num_available();
 }
 
 std::vector<TokenEvent> PrefillWorker::step() {
@@ -348,11 +356,27 @@ std::vector<TokenEvent> PrefillWorker::step() {
     if (p.done) continue;
     if (p.blocks.empty()) {
       std::lock_guard<std::mutex> lock(alloc_mu_);
-      if (!alloc_.allocate(kv.blocks_for(static_cast<int>(p.req.prompt.size())), p.blocks)) break;
+      const int len = static_cast<int>(p.req.prompt.size());
+      // Cached prefix blocks first (at least one token is left to compute), then fresh
+      // blocks for the rest of the prompt.
+      p.computed = alloc_.match_prefix(p.req.prompt, len - 1, p.blocks, p.hashes);
+      if (!alloc_.allocate(kv.blocks_for(len) - static_cast<int>(p.blocks.size()), p.blocks)) {
+        alloc_.release_all(p.blocks);
+        p.hashes.clear();
+        p.computed = 0;
+        break;
+      }
+      stats_.prompt_tokens += static_cast<std::uint64_t>(len);
+      stats_.prefix_hit_tokens += static_cast<std::uint64_t>(p.computed);
     }
     if (!p.begun) {
       sender_.begin(p.req, static_cast<int>(p.blocks.size()));
       p.begun = true;
+      // Blocks that came from the prefix cache are complete already: send them now.
+      int cached = p.computed / kv.block_size;
+      if (cached > 0)
+        for (int l = 0; l < kv.layers; ++l)
+          sender_.layer(p.req.id, l, 0, std::vector<int>(p.blocks.begin(), p.blocks.begin() + cached));
     }
     int n = std::min(budget, static_cast<int>(p.req.prompt.size()) - p.computed);
     std::vector<int> chunk(p.req.prompt.begin() + p.computed, p.req.prompt.begin() + p.computed + n);
@@ -388,6 +412,11 @@ std::vector<TokenEvent> PrefillWorker::step() {
   for (std::size_t i = 0; i < members.size(); ++i) {
     Pending* p = members[i].p;
     p->computed += static_cast<int>(batch.seqs[i].tokens.size());
+    {
+      std::lock_guard<std::mutex> lock(alloc_mu_);
+      stats_.forward_tokens += batch.seqs[i].tokens.size();
+      alloc_.register_full(p->req.prompt, p->computed, p->blocks, p->hashes);
+    }
     if (!batch.seqs[i].want_logits) continue;
     const float* lg = logits.data() + static_cast<std::size_t>(row++) * V;
     if (on_logits) on_logits(p->req.id, lg);

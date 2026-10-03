@@ -165,13 +165,20 @@ class KVReceiver {
 // chunks (up to max_batch_tokens), streams every layer's KV blocks to the decode side as
 // the layer completes, samples each finished prompt's first token, and sends End.
 // The request's blocks are freed once its last frame is on the wire.
+struct PrefillStats {
+  std::uint64_t prompt_tokens = 0;
+  std::uint64_t prefix_hit_tokens = 0;
+  std::uint64_t forward_tokens = 0;
+};
+
 class PrefillWorker {
  public:
-  PrefillWorker(Backend& backend, KVSender& sender, int max_batch_tokens);
+  PrefillWorker(Backend& backend, KVSender& sender, int max_batch_tokens, bool prefix_caching = true);
   void add(Request r);
   bool has_work() const;
   std::vector<TokenEvent> step();
   int free_blocks() const;
+  PrefillStats stats() const;
   // Called with the logits each request's first token was sampled from.
   std::function<void(std::uint64_t id, const float* logits)> on_logits;
   // false: send every layer after the forward pass instead of during it (the baseline
@@ -182,6 +189,7 @@ class PrefillWorker {
   struct Pending {
     Request req;
     std::vector<int> blocks;
+    std::vector<std::uint64_t> hashes;
     int computed = 0;
     bool begun = false;
     bool done = false;
@@ -190,7 +198,8 @@ class PrefillWorker {
   KVSender& sender_;
   int budget_;
   mutable std::mutex alloc_mu_;  // the sender thread frees blocks
-  BlockAllocator alloc_;
+  BlockManager alloc_;
+  PrefillStats stats_;
   std::deque<Pending> queue_;
 };
 

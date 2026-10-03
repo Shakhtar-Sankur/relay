@@ -36,6 +36,7 @@ namespace relay {
 struct EngineOptions {
   int max_batch_tokens = 512;  // tokens per forward pass (decode tokens + prefill chunks)
   int max_seqs = 64;           // requests running at once
+  bool prefix_caching = true;  // reuse the KV blocks of prompt prefixes seen before
 };
 
 struct Request {
@@ -57,6 +58,9 @@ struct EngineStats {
   std::uint64_t steps = 0;
   std::uint64_t forward_tokens = 0;
   std::uint64_t preemptions = 0;
+  std::uint64_t prompt_tokens = 0;      // prompt tokens of admitted requests
+  std::uint64_t prefix_hit_tokens = 0;  // of those, found in the prefix cache
+  int cached_blocks = 0;
 };
 
 class Engine {
@@ -109,7 +113,7 @@ class Engine {
   mutable std::mutex mu_;
   Backend& backend_;
   EngineOptions opt_;
-  BlockAllocator alloc_;
+  BlockManager alloc_;
   std::deque<std::unique_ptr<Seq>> waiting_;
   std::vector<std::unique_ptr<Seq>> running_;
   std::uint64_t admitted_ = 0;
