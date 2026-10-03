@@ -9,6 +9,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
+#include <memory>
 #include <random>
 #include <string>
 #include <vector>
@@ -18,7 +20,6 @@
 
 using namespace relay;
 
-#ifdef RELAY_CUDA
 namespace {
 
 double rel_diff(const std::vector<float>& a, const std::vector<float>& b) {
@@ -37,21 +38,25 @@ struct Result {
 
 // Drives two backends through the same forward passes; the first one's greedy tokens feed
 // both, so they see identical inputs throughout.
-Result compare(const HostWeights& w, CudaOptions a_opt, CudaOptions b_opt, const std::vector<int>& prompt_lens,
+using Factory = std::function<std::unique_ptr<Backend>(const HostWeights&, int blocks, int block_size)>;
+
+Result compare(const HostWeights& w, const Factory& make_a, const Factory& make_b, const std::vector<int>& prompt_lens,
                int chunk, int decode_steps) {
   const int bs = 16, vocab = w.config.vocab;
   int total = 0;
   for (int len : prompt_lens) total += (len + decode_steps + 1 + bs - 1) / bs;
-  auto a = make_cuda_backend(w, total + 4, bs, 0, 2048, (total + 4) * bs, a_opt);
-  auto b = make_cuda_backend(w, total + 4, bs, 0, 2048, (total + 4) * bs, b_opt);
+  auto a = make_a(w, total + 4, bs);
+  auto b = make_b(w, total + 4, bs);
   std::mt19937 rng(7);
   struct Seq {
     std::vector<int> tokens, table;
-    int done = 0;  // tokens already in the cache
+    int prompt = 0;  // prompt length (tokens after it were generated)
+    int done = 0;    // tokens already in the cache
   };
   std::vector<Seq> seqs(prompt_lens.size());
   int next_block = 0;
   for (std::size_t i = 0; i < seqs.size(); ++i) {
+    seqs[i].prompt = prompt_lens[i];
     for (int t = 0; t < prompt_lens[i]; ++t) seqs[i].tokens.push_back(static_cast<int>(rng() % vocab));
     for (int k = 0; k < (prompt_lens[i] + decode_steps + 1 + bs - 1) / bs; ++k) seqs[i].table.push_back(next_block++);
   }
@@ -68,7 +73,7 @@ Result compare(const HostWeights& w, CudaOptions a_opt, CudaOptions b_opt, const
       res.argmax_agree += ia == ib;
       ++res.argmax_total;
       Seq& s = seqs[owners[r]];
-      if (s.done == static_cast<int>(s.tokens.size())) s.tokens.push_back(ia);  // the next token, chosen by A
+      if (s.done == s.prompt) s.tokens.push_back(ia);  // the first generated token, chosen by A
     }
   };
   // Prefill, several sequences' chunks per forward pass.
@@ -80,7 +85,7 @@ Result compare(const HostWeights& w, CudaOptions a_opt, CudaOptions b_opt, const
     int budget = 2048;
     for (std::size_t i = 0; i < seqs.size(); ++i) {
       Seq& s = seqs[i];
-      int left = static_cast<int>(s.tokens.size()) - s.done;
+      int left = s.prompt - s.done;  // only the prompt is prefilled
       if (left <= 0 || budget <= 0) continue;
       int n = std::min({left, chunk, budget});
       SeqChunk ch;
@@ -92,8 +97,8 @@ Result compare(const HostWeights& w, CudaOptions a_opt, CudaOptions b_opt, const
       owners.push_back(static_cast<int>(i));
       s.done += n;
       budget -= n;
-      more = more || s.done < static_cast<int>(s.tokens.size());
     }
+    for (const Seq& s : seqs) more = more || s.done < s.prompt;  // also those the budget left out
     step(batch, owners);
   }
   // Decode: every sequence adds one token per forward pass; on odd steps a fresh prompt
@@ -149,7 +154,27 @@ std::vector<std::string> models() {
 
 bool cuda() { return check::test_backend() == "cuda"; }
 
+#ifdef RELAY_CUDA
+Factory cuda_factory(CudaOptions o) {
+  return [o](const HostWeights& w, int blocks, int bs) { return make_cuda_backend(w, blocks, bs, 0, 2048, blocks * bs, o); };
+}
+#endif
+
+Factory cpu_factory() {
+  return [](const HostWeights& w, int blocks, int bs) { return make_cpu_backend(w, blocks, bs); };
+}
+
 }  // namespace
+
+// The harness itself, on the CPU backend against itself: must agree exactly.
+TEST(the_comparison_schedule_runs_and_agrees_with_itself) {
+  HostWeights w = HostWeights::load(RELAY_FIXTURES "/chat-tiny");
+  Result r = compare(w, cpu_factory(), cpu_factory(), {1, 17, 64, 200, 700, 1300}, 192, 12);
+  CHECK(r.worst == 0.0);
+  CHECK_EQ(r.argmax_agree, r.argmax_total);
+}
+
+#ifdef RELAY_CUDA
 
 TEST(m1_attention_equals_m0_attention) {
   if (!cuda()) {
@@ -163,7 +188,7 @@ TEST(m1_attention_equals_m0_attention) {
     const bool big = w.config.vocab > 10000;
     // Real models: fewer, shorter sequences (their logits are large); still past one decode slice.
     std::vector<int> lens = big ? std::vector<int>{1, 37, 300, 700} : std::vector<int>{1, 17, 64, 200, 700, 1300};
-    Result r = compare(w, m0, m1, lens, big ? 256 : 192, big ? 8 : 12);
+    Result r = compare(w, cuda_factory(m0), cuda_factory(m1), lens, big ? 256 : 192, big ? 8 : 12);
     std::fprintf(stderr, "  %-60s D=%d G=%d: worst relative logit difference %.2e, argmax agrees %d/%d\n", dir.c_str(),
                  w.config.head_dim, w.config.heads / w.config.kv_heads, r.worst, r.argmax_agree, r.argmax_total);
     CHECK(r.worst < 1e-2);
@@ -182,7 +207,7 @@ TEST(int8_weights_stay_close_to_fp16) {
     HostWeights w = HostWeights::load(dir);
     const bool big = w.config.vocab > 10000;
     std::vector<int> lens = big ? std::vector<int>{5, 120} : std::vector<int>{5, 60, 130};
-    Result r = compare(w, f16, i8, lens, 64, 10);
+    Result r = compare(w, cuda_factory(f16), cuda_factory(i8), lens, 64, 10);
     std::fprintf(stderr, "  %-60s int8 vs fp16: relative logit difference %.2e, argmax agrees %d/%d\n", dir.c_str(),
                  r.worst, r.argmax_agree, r.argmax_total);
     CHECK(r.worst < 0.25);  // a sanity bound; the printed numbers are the measurement

@@ -369,35 +369,54 @@ __global__ void decode_combine_kernel(const float* part_o, const float* part_ml,
 // with every token's activations. Larger batches dequantize into fp16 and use cuBLAS.
 
 constexpr int kInt8MaxTokens = 8;
+constexpr int kInt8Warps = 8;     // output rows per block
+constexpr int kInt8Slice = 512;   // activations staged in shared memory per step (32 lanes x 16)
 
+// Each block computes kInt8Warps output rows for every token. Per 512-wide slice of K, the
+// tokens' activations are staged once in shared memory for all the block's warps; each lane
+// then streams 16 int8 weights of its row and multiplies them with every token's slice.
 template <int TMAX>
-__global__ void gemv_int8_kernel(const int8_t* W, const float* row_scale, const __half* x, float* y, int T, int K, int N,
-                                 float beta) {
-  const int n = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), lane = threadIdx.x & 31;
-  if (n >= N) return;
-  const int8_t* w = W + static_cast<long long>(n) * K;
+__global__ void __launch_bounds__(kInt8Warps * 32)
+    gemv_int8_kernel(const int8_t* W, const float* row_scale, const __half* x, float* y, int T, int K, int N,
+                     float beta) {
+  __shared__ __align__(16) __half xs[TMAX][kInt8Slice];
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int n = blockIdx.x * kInt8Warps + warp;
+  const int8_t* w = W + static_cast<long long>(min(n, N - 1)) * K;
   float acc[TMAX];
 #pragma unroll
   for (int t = 0; t < TMAX; ++t) acc[t] = 0.0f;
-  for (int k = lane * 16; k < K; k += 32 * 16) {
-    int4 wv = *reinterpret_cast<const int4*>(w + k);
-    const int8_t* wb = reinterpret_cast<const int8_t*>(&wv);
-#pragma unroll
-    for (int t = 0; t < TMAX; ++t) {
-      if (t >= T) break;
-      const uint4* xr = reinterpret_cast<const uint4*>(x + static_cast<long long>(t) * K + k);
-      uint4 x0 = xr[0], x1 = xr[1];
-      const __half2* a = reinterpret_cast<const __half2*>(&x0);
-      const __half2* b = reinterpret_cast<const __half2*>(&x1);
-      float s = 0.0f;
-#pragma unroll
-      for (int e = 0; e < 4; ++e) {
-        float2 fa = __half22float2(a[e]), fb = __half22float2(b[e]);
-        s += wb[2 * e] * fa.x + wb[2 * e + 1] * fa.y + wb[8 + 2 * e] * fb.x + wb[8 + 2 * e + 1] * fb.y;
-      }
-      acc[t] += s;
+  for (int k0 = 0; k0 < K; k0 += kInt8Slice) {
+    for (int i = threadIdx.x; i < T * (kInt8Slice / 8); i += blockDim.x) {
+      const int t = i / (kInt8Slice / 8), c = (i % (kInt8Slice / 8)) * 8, k = k0 + c;
+      uint4 v = make_uint4(0, 0, 0, 0);
+      if (k < K) v = *reinterpret_cast<const uint4*>(x + static_cast<long long>(t) * K + k);
+      *reinterpret_cast<uint4*>(&xs[t][c]) = v;
     }
+    __syncthreads();
+    const int k = k0 + lane * 16;
+    if (n < N && k < K) {
+      int4 wv = *reinterpret_cast<const int4*>(w + k);
+      const int8_t* wb = reinterpret_cast<const int8_t*>(&wv);
+#pragma unroll
+      for (int t = 0; t < TMAX; ++t) {
+        if (t >= T) break;
+        uint4 x0 = *reinterpret_cast<const uint4*>(&xs[t][lane * 16]);
+        uint4 x1 = *reinterpret_cast<const uint4*>(&xs[t][lane * 16 + 8]);
+        const __half2* a = reinterpret_cast<const __half2*>(&x0);
+        const __half2* b = reinterpret_cast<const __half2*>(&x1);
+        float s = 0.0f;
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+          float2 fa = __half22float2(a[e]), fb = __half22float2(b[e]);
+          s += wb[2 * e] * fa.x + wb[2 * e + 1] * fa.y + wb[8 + 2 * e] * fb.x + wb[8 + 2 * e + 1] * fb.y;
+        }
+        acc[t] += s;
+      }
+    }
+    __syncthreads();  // xs is refilled next slice
   }
+  if (n >= N) return;
 #pragma unroll
   for (int t = 0; t < TMAX; ++t) {
     if (t >= T) break;

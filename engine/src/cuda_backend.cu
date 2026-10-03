@@ -623,7 +623,7 @@ class CudaBackend final : public Backend {
   void gemm(const DeviceMatrix& W, const __half* x, float* y, int T, float beta) {
     if (!W.i8.p) return gemm(W.f16.p, x, y, T, W.K, W.N, beta);
     if (T <= kernels::kInt8MaxTokens) {
-      const int warps = 8;
+      const int warps = kernels::kInt8Warps;
       kernels::gemv_int8_kernel<kernels::kInt8MaxTokens><<<(W.N + warps - 1) / warps, warps * 32, 0, stream_>>>(
           W.i8.p, W.scale.p, x, y, T, W.K, W.N, beta);
       return;
