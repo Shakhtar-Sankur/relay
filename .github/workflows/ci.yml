@@ -1,0 +1,25 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  cpu:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - run: sudo apt-get install -y --no-install-recommends ninja-build
+      - run: cmake -S . -B build -G Ninja -DRELAY_NATIVE=OFF
+      - run: cmake --build build
+      - name: tests (logits against Hugging Face on 4 tiny models; batching, chunking, preemption and KV-block moves bit for bit)
+        run: ctest --test-dir build --output-on-failure
+
+  cuda-compiles:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ninja-build nvidia-cuda-toolkit
+      - run: cmake -S . -B build -G Ninja -DRELAY_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75 -DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler
+      - run: cmake --build build
