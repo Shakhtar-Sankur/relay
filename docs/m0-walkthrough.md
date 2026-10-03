@@ -132,4 +132,11 @@ checked to catch the mistakes they are meant to catch.
 | Qwen2.5-0.5B | 2.7e-6 | 12/12 identical |
 | TinyLlama-1.1B | 1.6e-6 | 12/12 identical |
 
-GPU results come from `scripts/colab_m0.sh` on a T4.
+On a Tesla T4 (`scripts/colab_m0.sh`, raw output in `results/t4/`), the CUDA backend
+(fp16 weights and cache) is within 3e-4 to 1.2e-3 relative error of transformers on every
+model, with identical greedy tokens, and every batching test passes. Speed with M0's simple
+kernels, TinyLlama-1.1B: 92 tok/s at batch 1, 535 at batch 8, 1,217 at batch 32.
+
+*Q: Why is the GPU error 1000x the CPU error?* fp16 has 11 bits of mantissa against
+float32's 24: rounding the weights and the KV cache to fp16 costs about 3 decimal digits.
+It is the expected size, and the greedy tokens still match.

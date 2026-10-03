@@ -24,7 +24,7 @@ questions: [`docs/m0-walkthrough.md`](docs/m0-walkthrough.md).
 
 | | Milestone | State |
 |---|---|---|
-| M0 | Engine core: Llama-architecture models (Llama 2/3.x, TinyLlama, SmolLM2, Qwen2), float32 CPU reference backend, CUDA backend (fp16, cuBLAS), paged KV cache, continuous batching with chunked prefill and preemption | done on CPU; GPU run pending |
+| M0 | Engine core: Llama-architecture models (Llama 2/3.x, TinyLlama, SmolLM2, Qwen2), float32 CPU reference backend, CUDA backend (fp16, cuBLAS), paged KV cache, continuous batching with chunked prefill and preemption | done |
 | M1 | CUDA kernels: paged decode attention, flash-style prefill, fused RMSNorm/RoPE, int8 weights | |
 | M2 | KV transfer engine: layer-by-layer streaming, CUDA IPC, zero-copy TCP | |
 | M3 | Swift control plane: Swift↔C++ interop, gRPC, OpenAI API, tokenizer | |
@@ -34,17 +34,23 @@ questions: [`docs/m0-walkthrough.md`](docs/m0-walkthrough.md).
 
 ## Correctness so far
 
-Logits against Hugging Face transformers on the same weights and tokens, float32 CPU
-backend, every prompt position and every generated step:
+Logits against Hugging Face transformers on the same weights and tokens, every prompt
+position and every generated step. CPU backend: float32. CUDA backend: fp16 weights and
+KV cache, fp32 accumulation, on a Tesla T4 (raw output:
+[`results/t4/m0-2026-10-03.txt`](results/t4/m0-2026-10-03.txt)).
 
-| Model | Largest relative error | Greedy continuation |
-|---|---|---|
-| 4 tiny random fixtures (MHA; GQA + tied bf16; Llama 3 RoPE scaling; Qwen2 biases) | 4e-7 to 7e-7 | identical |
-| SmolLM2-135M | 2.0e-6 | identical (12 tokens) |
-| Qwen2.5-0.5B | 2.7e-6 | identical (12 tokens) |
-| TinyLlama-1.1B | 1.6e-6 | identical (12 tokens) |
+| Model | CPU: largest relative error | CUDA (T4): largest relative error | Greedy continuation |
+|---|---|---|---|
+| 4 tiny random fixtures (MHA; GQA + tied bf16; Llama 3 RoPE scaling; Qwen2 biases) | 4e-7 to 7e-7 | 3e-4 to 1.1e-3 | identical on both |
+| SmolLM2-135M | 2.4e-6 | 1.2e-3 | identical (12 tokens) on both |
+| Qwen2.5-0.5B | 2.7e-6 | not run | identical (12 tokens) on CPU |
+| TinyLlama-1.1B | 1.6e-6 | 8.7e-4 | identical (12 tokens) on both |
 
-And, bit for bit on the CPU backend: a request gives the same logits run alone or in a
+M0 generation speed on the T4, TinyLlama-1.1B, 128 new tokens per request: 92 tok/s for
+one request, 535 tok/s for 8, 1,217 tok/s for 32 (continuous batching; cuBLAS GEMMs and a
+simple attention kernel that M1 replaces). These are starting points, not comparisons.
+
+The batching tests pass on both backends; bit for bit on the CPU backend: a request gives the same logits run alone or in a
 batch of eight, with its prompt in 7-token chunks, after being preempted and recomputed,
 with any block size, and when its KV blocks are copied to a second backend that continues
 decoding (disaggregation in miniature).

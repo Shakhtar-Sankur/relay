@@ -1,0 +1,25 @@
+# scripts/colab_m0.sh on Colab, Tesla T4 (driver 580.178.04, 15360 MiB), relay commit 97787e7
+== tests on the cuda backend
+test_safetensors: ok  (4 tests, 0 failed)
+test_sampler: ok  (4 tests, 0 failed)
+test_kv_cache: ok  (5 tests, 0 failed)
+test_reference: ok  (2 tests, 0 failed)
+      llama-gqa-tied-bf16 (cuda): 21 prompt rows, largest relative error 5.12e-04
+      llama-mha (cuda): 21 prompt rows, largest relative error 8.07e-04
+      llama3-rope (cuda): 21 prompt rows, largest relative error 9.08e-04
+      qwen2-bias (cuda): 21 prompt rows, largest relative error 6.12e-04
+      smollm2-135m (cuda): 1 prompt rows, largest relative error 4.83e-04
+      tinyllama-1.1b (cuda): 1 prompt rows, largest relative error 3.89e-04
+      llama-gqa-tied-bf16 (cuda): 8 generated tokens identical, largest relative error 3.46e-04
+      llama-mha (cuda): 8 generated tokens identical, largest relative error 1.12e-03
+      llama3-rope (cuda): 8 generated tokens identical, largest relative error 6.75e-04
+      qwen2-bias (cuda): 8 generated tokens identical, largest relative error 4.83e-04
+      smollm2-135m (cuda): 12 generated tokens identical, largest relative error 1.16e-03
+      tinyllama-1.1b (cuda): 12 generated tokens identical, largest relative error 8.66e-04
+test_batching: ok  (5 tests, 0 failed)
+      3 preemptions
+== tests on the cpu backend (same machine): all passed; largest relative error 2.40e-06 (smollm2-135m)
+== generation speed, TinyLlama-1.1B, 10-token prompt, 128 new tokens each (M0 kernels: cuBLAS GEMMs, simple attention)
+  batch 1: cuda backend: loaded in 13.11 s; 128 tokens generated in 1.39 s (91.9 tok/s), 128 steps, 0 preemptions
+  batch 8: cuda backend: loaded in 13.11 s; 1024 tokens generated in 1.91 s (535.2 tok/s), 128 steps, 0 preemptions
+  batch 32: cuda backend: loaded in 13.07 s; 4096 tokens generated in 3.37 s (1216.7 tok/s), 128 steps, 0 preemptions
