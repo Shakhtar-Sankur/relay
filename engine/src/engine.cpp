@@ -62,6 +62,23 @@ void Engine::add_recompute(Request request, int first_token) {
   waiting_.push_back(std::move(s));
 }
 
+bool Engine::cancel(std::uint64_t id) {
+  std::lock_guard<std::mutex> lock(mu_);
+  for (auto it = waiting_.begin(); it != waiting_.end(); ++it)
+    if ((*it)->req.id == id) {
+      alloc_.release_all((*it)->blocks);
+      waiting_.erase(it);
+      return true;
+    }
+  for (auto it = running_.begin(); it != running_.end(); ++it)
+    if ((*it)->req.id == id) {
+      alloc_.release_all((*it)->blocks);
+      running_.erase(it);
+      return true;
+    }
+  return false;
+}
+
 void Engine::release_blocks(std::vector<int>& blocks) {
   std::lock_guard<std::mutex> lock(mu_);
   alloc_.release_all(blocks);

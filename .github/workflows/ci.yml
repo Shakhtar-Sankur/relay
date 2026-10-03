@@ -28,6 +28,19 @@ jobs:
           OMP_NUM_THREADS=1 TSAN_OPTIONS=halt_on_error=1 ./build/test_transfer
           OMP_NUM_THREADS=1 TSAN_OPTIONS=halt_on_error=1 ./build/test_batching
 
+  swift:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Swift 6.4 toolchain
+        run: |
+          sudo mkdir -p /opt/swift
+          curl -sSfL https://download.swift.org/swift-6.4.0-release/ubuntu2404/swift-6.4.0-RELEASE/swift-6.4.0-RELEASE-ubuntu24.04.tar.gz | sudo tar xz -C /opt/swift --strip-components=1
+          echo /opt/swift/usr/bin >> "$GITHUB_PATH"
+      - run: swift build --build-tests
+      - name: tokenizer vs Hugging Face, chat templates vs transformers, the OpenAI server end to end (Swift calling the C++ engine)
+        run: swift test --skip-build
+
   cuda-compiles:
     runs-on: ubuntu-24.04
     steps:

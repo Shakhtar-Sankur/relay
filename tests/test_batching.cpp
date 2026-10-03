@@ -119,6 +119,31 @@ TEST(block_size_does_not_matter) {
   if (check::exact_backend()) compare(a_log, b_log);
 }
 
+TEST(cancel_frees_the_request_and_spares_the_others) {
+  HostWeights w = HostWeights::load(kModel);
+  auto rs = make_requests(w.config.vocab);
+  LogitLog full_log, cut_log;
+  auto full = run(w, rs, 64, 16, {512, 64}, false, full_log);
+  auto be = check::make_backend(w, 64, 16);
+  Engine e(*be, {512, 64});
+  for (const auto& r : rs) e.add(r);
+  std::map<std::uint64_t, std::vector<int>> out;
+  for (const TokenEvent& ev : e.step()) out[ev.id].push_back(ev.token);
+  CHECK(e.cancel(rs[2].id));   // running
+  CHECK(!e.cancel(rs[2].id));  // already gone
+  CHECK(!e.cancel(424242));
+  while (e.has_work())
+    for (const TokenEvent& ev : e.step()) out[ev.id].push_back(ev.token);
+  CHECK_EQ(e.free_blocks(), 64);
+  for (const auto& r : rs) {
+    if (r.id == rs[2].id) {
+      CHECK(out[r.id].size() <= 1);
+    } else {
+      CHECK(out[r.id] == full[r.id]);
+    }
+  }
+}
+
 TEST(rejects_requests_that_can_never_fit) {
   HostWeights w = HostWeights::load(kModel);
   auto be = check::make_backend(w, 4, 4);

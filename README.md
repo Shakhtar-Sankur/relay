@@ -19,7 +19,8 @@ CUDA, written from scratch.
 
 Why and how: [`docs/design.md`](docs/design.md). Code walkthrough with interview
 questions: [`docs/m0-walkthrough.md`](docs/m0-walkthrough.md) (engine),
-[`docs/m2-walkthrough.md`](docs/m2-walkthrough.md) (KV transfer).
+[`docs/m2-walkthrough.md`](docs/m2-walkthrough.md) (KV transfer),
+[`docs/m3-walkthrough.md`](docs/m3-walkthrough.md) (Swift control plane).
 
 ## Status
 
@@ -28,7 +29,7 @@ questions: [`docs/m0-walkthrough.md`](docs/m0-walkthrough.md) (engine),
 | M0 | Engine core: Llama-architecture models (Llama 2/3.x, TinyLlama, SmolLM2, Qwen2), float32 CPU reference backend, CUDA backend (fp16, cuBLAS), paged KV cache, continuous batching with chunked prefill and preemption | done |
 | M1 | CUDA kernels: paged decode attention, flash-style prefill, fused RMSNorm/RoPE, int8 weights | |
 | M2 | KV transfer engine: layer-by-layer streaming during the forward pass, zero-copy TCP and shared-memory transports, recompute fallback under memory pressure | done |
-| M3 | Swift control plane: Swift↔C++ interop, gRPC, OpenAI API, tokenizer | |
+| M3 | Swift control plane: Swift↔C++ interop, a tokenizer matching Hugging Face, chat templates, an OpenAI-compatible HTTP API with streaming | done (in-process engine; remote workers in M4) |
 | M4 | Disaggregated scheduling: prefix-cache-aware routing, prefill/decode pools, admission | |
 | M5 | Fault tolerance and deterministic cluster simulation | |
 | M6 | Benchmarks on 2-4 GPUs against colocated serving and vLLM | |
@@ -87,6 +88,22 @@ layer was 64 small copies into pageable memory, which cannot overlap kernels. A 
 kernel and one copy per layer into page-locked memory fixed it. The forward pass times are
 M0's attention kernel, which M1 replaces; a faster prefill leaves less time to hide the
 transfer in, so these numbers will be re-measured after M1.
+
+## The Swift control plane (M3)
+
+```bash
+swift build -c release
+.build/release/relay-server --model path/to/SmolLM2-135M --port 8000
+curl localhost:8000/v1/chat/completions -d '{"messages":[{"role":"user","content":"Hi"}],"stream":true}'
+```
+
+Swift calls the C++ engine directly (Swift 6 C++ interoperability; the engine is a
+reference-counted class to Swift). The tokenizer, written in Swift, gives the same ids as
+Hugging Face `tokenizers` on all 25 test strings for SmolLM2, Qwen2.5 and TinyLlama, and
+chat templates render exactly as `apply_chat_template`. On the real SmolLM2-135M,
+`/v1/completions` returns transformers' greedy continuation word for word. Tests cover
+streaming, stop strings (never leaked, request cancelled in the engine), concurrent requests
+and clients hanging up. Walkthrough: [`docs/m3-walkthrough.md`](docs/m3-walkthrough.md).
 
 ## Build and test
 

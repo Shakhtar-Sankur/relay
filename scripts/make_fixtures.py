@@ -73,6 +73,65 @@ def tiny_models():
         print("wrote", out)
 
 
+CHATML = (
+    "{% for message in messages %}{% if loop.first and messages[0]['role'] != 'system' %}"
+    "{{ '<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n' }}{% endif %}"
+    "{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}"
+    "{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}")
+
+CONVERSATIONS = [
+    [{"role": "user", "content": "Hi there"}],
+    [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "What is 2+2?"}],
+    [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "Hi"},
+     {"role": "assistant", "content": "Hello! How can I help?"}, {"role": "user", "content": "Tell me about café 東京 🚀"}],
+]
+
+
+def chat_cases(path):
+    """How transformers renders a few conversations with the model's chat template."""
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(path)
+    cases = [{"messages": m, "text": tok.apply_chat_template(m, tokenize=False, add_generation_prompt=True)}
+             for m in CONVERSATIONS]
+    with open(os.path.join(path, "relay-chat-cases.json"), "w") as f:
+        json.dump(cases, f, ensure_ascii=False)
+
+
+def chat_fixture():
+    """A tiny model with a real tokenizer and chat template, for end-to-end server tests."""
+    out = os.path.join(FIXTURES, "chat-tiny")
+    os.makedirs(out, exist_ok=True)
+    tok_src = os.path.join(FIXTURES, "tokenizers", "gpt2-digits.json")
+    with open(tok_src) as f:
+        tok_json = json.load(f)
+    vocab = max(max(tok_json["model"]["vocab"].values()), max(a["id"] for a in tok_json["added_tokens"])) + 1
+    im_end = next(a["id"] for a in tok_json["added_tokens"] if a["content"] == "<|im_end|>")
+    torch.manual_seed(4321)
+    cfg = LlamaConfig(vocab_size=vocab, hidden_size=64, intermediate_size=160, num_hidden_layers=2,
+                      num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=512,
+                      rms_norm_eps=1e-6, tie_word_embeddings=True, eos_token_id=im_end, bos_token_id=None)
+    model = AutoModelForCausalLM.from_config(cfg, torch_dtype=torch.float32)
+    with torch.no_grad():
+        for p in model.parameters():
+            p.normal_(0.0, 0.15)
+    model.save_pretrained(out, safe_serialization=True)
+    with open(os.path.join(out, "tokenizer.json"), "w") as f:
+        json.dump(tok_json, f, ensure_ascii=False)
+    with open(os.path.join(out, "tokenizer_config.json"), "w") as f:
+        json.dump({"chat_template": CHATML, "eos_token": "<|im_end|>", "bos_token": None,
+                   "tokenizer_class": "PreTrainedTokenizerFast", "model_max_length": 512}, f)
+    model = AutoModelForCausalLM.from_pretrained(out, torch_dtype=torch.float32)
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(out)
+    text = tok.apply_chat_template(CONVERSATIONS[1], tokenize=False, add_generation_prompt=True)
+    ref = reference(model, tok(text)["input_ids"], 8)
+    ref["text"] = text
+    with open(os.path.join(out, "relay-reference.json"), "w") as f:
+        json.dump(ref, f)
+    chat_cases(out)
+    print("wrote", out, "vocab", vocab)
+
+
 def real_model(path, prompt_text, new_tokens):
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(path)
@@ -96,5 +155,8 @@ if __name__ == "__main__":
     a = ap.parse_args()
     if a.model:
         real_model(a.model, a.prompt, a.new_tokens)
+        if os.path.exists(os.path.join(a.model, "tokenizer_config.json")):
+            chat_cases(a.model)
     else:
         tiny_models()
+        chat_fixture()
