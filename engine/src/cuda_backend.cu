@@ -17,6 +17,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 
@@ -232,6 +233,23 @@ __global__ void silu_mul_kernel(const float* gu, __half* act, int I) {
   }
 }
 
+// Copies blocks of one layer's K and V into (gather) or out of (scatter) one contiguous
+// buffer laid out as [K of each block][V of each block], 16 bytes per thread step.
+__global__ void kv_gather_kernel(const uint4* k, const uint4* v, const int* blocks, int n, long long block_vec,
+                                 uint4* out) {
+  int i = blockIdx.x, which = blockIdx.y;
+  const uint4* src = (which ? v : k) + static_cast<long long>(blocks[i]) * block_vec;
+  uint4* dst = out + (static_cast<long long>(which) * n + i) * block_vec;
+  for (long long e = threadIdx.x; e < block_vec; e += blockDim.x) dst[e] = src[e];
+}
+
+__global__ void kv_scatter_kernel(uint4* k, uint4* v, const int* blocks, int n, long long block_vec, const uint4* in) {
+  int i = blockIdx.x, which = blockIdx.y;
+  uint4* dst = (which ? v : k) + static_cast<long long>(blocks[i]) * block_vec;
+  const uint4* src = in + (static_cast<long long>(which) * n + i) * block_vec;
+  for (long long e = threadIdx.x; e < block_vec; e += blockDim.x) dst[e] = src[e];
+}
+
 // ---- backend ----------------------------------------------------------------
 
 struct DeviceLayer {
@@ -251,6 +269,7 @@ class CudaBackend final : public Backend {
     layer_done_.resize(c_.layers);
     for (auto& e : layer_done_) CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
     layout_ = {c_.layers, c_.kv_heads, c_.head_dim, block_size, num_blocks};
+    if (kv_block_bytes() % 16 != 0) throw std::invalid_argument("a KV block must be a multiple of 16 bytes");
 
     // Attention keeps one float per visible position in shared memory.
     std::size_t smem = static_cast<std::size_t>(max_context_ + c_.head_dim) * sizeof(float);
@@ -258,8 +277,18 @@ class CudaBackend final : public Backend {
     CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
     if (smem > prop.sharedMemPerBlockOptin)
       throw std::invalid_argument("max_context too long for this GPU's shared memory (M1's kernel lifts this)");
-    CUDA_CHECK(cudaFuncSetAttribute(attention_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                    static_cast<int>(smem)));
+    // The limit belongs to the kernel, for the whole process, not to this backend: only
+    // ever raise it, or a second backend with a shorter context would break the first.
+    {
+      static std::mutex mu;
+      static std::size_t current = 0;
+      std::lock_guard<std::mutex> lock(mu);
+      if (smem > current) {
+        CUDA_CHECK(cudaFuncSetAttribute(attention_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        static_cast<int>(smem)));
+        current = smem;
+      }
+    }
 
     embed_ = to_device_f16(w.embed);
     lm_head_ = w.lm_head.empty() ? DeviceArray<__half>() : to_device_f16(w.lm_head);
@@ -299,6 +328,7 @@ class CudaBackend final : public Backend {
   }
 
   ~CudaBackend() override {
+    if (pinned_) cudaFreeHost(pinned_);
     if (cublas_) cublasDestroy(cublas_);
     for (auto e : layer_done_) cudaEventDestroy(e);
     if (stream_) cudaStreamDestroy(stream_);
@@ -405,23 +435,57 @@ class CudaBackend final : public Backend {
   }
 
   // K blocks to k_out and V blocks to v_out, on the copy stream.
-  void read_kv_layer(int layer, const std::vector<int>& blocks, void*, void* k_out, void* v_out) {
-    const std::size_t bb = kv_block_bytes();
-    for (std::size_t i = 0; i < blocks.size(); ++i) {
-      std::size_t off = static_cast<std::size_t>(layer * layout_.layer_elems() + blocks[i] * layout_.block_elems());
-      CUDA_CHECK(cudaMemcpyAsync(static_cast<char*>(k_out) + i * bb, kc_.p + off, bb, cudaMemcpyDeviceToHost, copy_stream_));
-      CUDA_CHECK(cudaMemcpyAsync(static_cast<char*>(v_out) + i * bb, vc_.p + off, bb, cudaMemcpyDeviceToHost, copy_stream_));
+  // KV traffic for the transfer engine. One layer's blocks are gathered on the GPU into a
+  // contiguous buffer and moved in a single copy to page-locked host memory (only
+  // page-locked memory lets a copy run while kernels run); writes go the other way and
+  // are scattered by a kernel. All on the copy stream, never waiting for the forward pass.
+  void ensure_staging(std::size_t n_blocks) {
+    std::size_t bytes = 2 * n_blocks * kv_block_bytes();
+    if (bytes > staging_dev_.n * sizeof(uint4)) {
+      staging_dev_ = DeviceArray<uint4>((bytes + 15) / 16);
     }
+    std::size_t need = bytes + n_blocks * sizeof(int);
+    if (need > pinned_bytes_) {
+      if (pinned_) CUDA_CHECK(cudaFreeHost(pinned_));
+      CUDA_CHECK(cudaMallocHost(&pinned_, need));
+      pinned_bytes_ = need;
+    }
+    if (n_blocks > staging_ids_.n) staging_ids_ = DeviceArray<int>(n_blocks);
+  }
+
+  void read_kv_layer(int layer, const std::vector<int>& blocks, void*, void* k_out, void* v_out) {
+    std::lock_guard<std::mutex> lock(copy_mu_);
+    const std::size_t bb = kv_block_bytes(), n = blocks.size();
+    ensure_staging(n);
+    auto* ids = reinterpret_cast<int*>(static_cast<char*>(pinned_) + 2 * n * bb);
+    std::memcpy(ids, blocks.data(), n * sizeof(int));
+    CUDA_CHECK(cudaMemcpyAsync(staging_ids_.p, ids, n * sizeof(int), cudaMemcpyHostToDevice, copy_stream_));
+    const std::size_t off = static_cast<std::size_t>(layer) * layout_.layer_elems();
+    kv_gather_kernel<<<dim3(static_cast<unsigned>(n), 2), 256, 0, copy_stream_>>>(
+        reinterpret_cast<const uint4*>(kc_.p + off), reinterpret_cast<const uint4*>(vc_.p + off), staging_ids_.p,
+        static_cast<int>(n), static_cast<long long>(bb / 16), staging_dev_.p);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemcpyAsync(pinned_, staging_dev_.p, 2 * n * bb, cudaMemcpyDeviceToHost, copy_stream_));
     CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
+    std::memcpy(k_out, pinned_, n * bb);
+    std::memcpy(v_out, static_cast<char*>(pinned_) + n * bb, n * bb);
   }
 
   void write_kv_layer(int layer, const std::vector<int>& blocks, const void* k_in, const void* v_in) {
-    const std::size_t bb = kv_block_bytes();
-    for (std::size_t i = 0; i < blocks.size(); ++i) {
-      std::size_t off = static_cast<std::size_t>(layer * layout_.layer_elems() + blocks[i] * layout_.block_elems());
-      CUDA_CHECK(cudaMemcpyAsync(kc_.p + off, static_cast<const char*>(k_in) + i * bb, bb, cudaMemcpyHostToDevice, copy_stream_));
-      CUDA_CHECK(cudaMemcpyAsync(vc_.p + off, static_cast<const char*>(v_in) + i * bb, bb, cudaMemcpyHostToDevice, copy_stream_));
-    }
+    std::lock_guard<std::mutex> lock(copy_mu_);
+    const std::size_t bb = kv_block_bytes(), n = blocks.size();
+    ensure_staging(n);
+    std::memcpy(pinned_, k_in, n * bb);
+    std::memcpy(static_cast<char*>(pinned_) + n * bb, v_in, n * bb);
+    auto* ids = reinterpret_cast<int*>(static_cast<char*>(pinned_) + 2 * n * bb);
+    std::memcpy(ids, blocks.data(), n * sizeof(int));
+    CUDA_CHECK(cudaMemcpyAsync(staging_ids_.p, ids, n * sizeof(int), cudaMemcpyHostToDevice, copy_stream_));
+    CUDA_CHECK(cudaMemcpyAsync(staging_dev_.p, pinned_, 2 * n * bb, cudaMemcpyHostToDevice, copy_stream_));
+    const std::size_t off = static_cast<std::size_t>(layer) * layout_.layer_elems();
+    kv_scatter_kernel<<<dim3(static_cast<unsigned>(n), 2), 256, 0, copy_stream_>>>(
+        reinterpret_cast<uint4*>(kc_.p + off), reinterpret_cast<uint4*>(vc_.p + off), staging_ids_.p,
+        static_cast<int>(n), static_cast<long long>(bb / 16), staging_dev_.p);
+    CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
   }
 
@@ -439,6 +503,11 @@ class CudaBackend final : public Backend {
   cublasHandle_t cublas_ = nullptr;
   cudaStream_t stream_ = nullptr, copy_stream_ = nullptr;
   std::vector<cudaEvent_t> layer_done_;
+  std::mutex copy_mu_;
+  DeviceArray<uint4> staging_dev_;
+  DeviceArray<int> staging_ids_;
+  void* pinned_ = nullptr;
+  std::size_t pinned_bytes_ = 0;
   DeviceArray<__half> embed_, lm_head_;
   DeviceArray<float> final_norm_, inv_freq_;
   std::vector<DeviceLayer> layers_;

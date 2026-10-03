@@ -1,0 +1,23 @@
+# scripts/colab_m2.sh on Colab, Tesla T4, relay commit 95bf546 (before the fixes in the next commit)
+# Two problems found here:
+#  - test_transfer on CUDA aborted: "CUDA: invalid argument at cudaGetLastError()". The attention
+#    kernel's shared-memory limit (cudaFuncSetAttribute) is per process; a second backend with a
+#    shorter context lowered it below what the first backend launches with.
+#  - streaming hid almost nothing, at 0.4-0.6 GB/s: each layer was 2 x 32 separate 8 KB
+#    cudaMemcpyAsync calls into pageable memory, which cannot overlap kernels.
+== tests on the cuda backend
+test_safetensors: ok  (4 tests, 0 failed)
+test_sampler: ok  (4 tests, 0 failed)
+test_kv_cache: ok  (5 tests, 0 failed)
+test_reference: ok  (2 tests, 0 failed)
+test_batching: ok  (5 tests, 0 failed)
+test_transfer: FAILED  (  what():  CUDA: invalid argument at cudaGetLastError())
+== raw transport speed (Colab VM, 4 vCPU)
+tcp:  4K 0.52 GB/s, 64K 2.97, 1M 4.39, 16M 3.07
+shm:  4K 4.19 GB/s, 64K 5.92, 1M 5.55, 16M 4.20
+== layer streaming vs sending after the forward pass, TinyLlama-1.1B, CUDA backend
+512 tokens (11.53 MB KV), tcp: forward 261 ms; exposed transfer after forward 22.7 ms, streamed 19.6 ms (14% hidden)
+512 tokens, shm:               forward 262 ms; after 29.8 ms, streamed 31.2 ms (-5%)
+2048 tokens (46.14 MB), tcp:   forward 3905 ms; after 81.7 ms, streamed 80.7 ms (1%)
+2048 tokens, shm:              forward 4046 ms; after 113.0 ms, streamed 121.1 ms (-7%)
+# The forward pass itself is slow at 2048 tokens (M0's attention kernel); M1 replaces it.

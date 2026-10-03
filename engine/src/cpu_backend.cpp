@@ -4,7 +4,6 @@
 // sequence of floating-point operations no matter how many other tokens are in the
 // batch. Running a sequence alone or inside any batch therefore gives bit-identical
 // logits, which the batching tests rely on.
-#include <omp.h>
 
 #include <algorithm>
 #include <cmath>
