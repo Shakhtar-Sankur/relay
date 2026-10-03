@@ -1,0 +1,411 @@
+#include "relay/kv_transfer.h"
+
+#include <algorithm>
+#include <chrono>
+#include <memory>
+#include <cstring>
+#include <stdexcept>
+#include <string>
+
+#include "relay/sampler.h"
+
+namespace relay {
+
+KVFingerprint KVFingerprint::of(const Backend& b) {
+  const KVLayout& l = b.kv_layout();
+  return {l.layers, l.kv_heads, l.head_dim, l.block_size, static_cast<std::int32_t>(b.kv_block_bytes()), b.config().vocab};
+}
+
+namespace {
+
+FrameHeader header(FrameType t, std::uint64_t request, std::uint32_t a, std::uint32_t b, std::uint64_t payload) {
+  return FrameHeader{kFrameMagic, static_cast<std::uint16_t>(t), 0, request, a, b, payload};
+}
+
+}  // namespace
+
+// ---- sender -----------------------------------------------------------------
+
+KVSender::KVSender(Backend& backend, Connection& conn) : be_(backend), conn_(conn) {
+  KVFingerprint fp = KVFingerprint::of(be_);
+  Job hello{FrameType::Hello};
+  hello.payload.resize(sizeof fp);
+  std::memcpy(hello.payload.data(), &fp, sizeof fp);
+  queue_.push_back(std::move(hello));
+  thread_ = std::thread([this] { run(); });
+}
+
+KVSender::~KVSender() {
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    stop_ = true;
+  }
+  cv_.notify_all();
+  thread_.join();
+}
+
+void KVSender::push(Job j) {
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (error_) std::rethrow_exception(error_);
+    queue_.push_back(std::move(j));
+  }
+  cv_.notify_one();
+}
+
+void KVSender::begin(const Request& r, int num_blocks) {
+  BeginInfo info{static_cast<std::uint32_t>(r.prompt.size()), static_cast<std::uint32_t>(num_blocks),
+                 r.params.max_new_tokens, r.params.temperature, r.params.top_p, r.params.top_k, r.params.seed,
+                 r.params.ignore_eos ? 1u : 0u, 0};
+  Job j{FrameType::Begin, r.id};
+  j.payload.resize(sizeof info + r.prompt.size() * sizeof(std::int32_t));
+  std::memcpy(j.payload.data(), &info, sizeof info);
+  std::memcpy(j.payload.data() + sizeof info, r.prompt.data(), r.prompt.size() * sizeof(std::int32_t));
+  push(std::move(j));
+}
+
+void KVSender::layer(std::uint64_t request, int layer, int first_index, std::vector<int> blocks) {
+  Job j{FrameType::Layer, request, layer, first_index};
+  j.blocks = std::move(blocks);
+  push(std::move(j));
+}
+
+void KVSender::end(std::uint64_t request, int first_token, bool finished, std::function<void()> on_sent) {
+  Job j{FrameType::End, request, first_token, finished ? 1 : 0};
+  j.on_sent = std::move(on_sent);
+  push(std::move(j));
+}
+
+void KVSender::abort(std::uint64_t request) { push(Job{FrameType::Abort, request}); }
+
+void KVSender::flush() {
+  std::unique_lock<std::mutex> lock(mu_);
+  idle_cv_.wait(lock, [this] { return (queue_.empty() && !busy_) || error_; });
+  if (error_) std::rethrow_exception(error_);
+}
+
+TransferStats KVSender::stats() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return stats_;
+}
+
+void KVSender::send_layer(Job& j) {
+  const std::size_t bb = be_.kv_block_bytes(), n = j.blocks.size();
+  FrameHeader h = header(FrameType::Layer, j.request, j.a, j.b, 2 * n * bb);
+  be_.wait_kv_written(j.a);
+  if (be_.kv_host_ptr(j.a, j.blocks[0], false)) {
+    // The cache is in host memory: point the socket straight at the blocks.
+    std::vector<Slice> s;
+    s.reserve(1 + 2 * n);
+    s.push_back({&h, sizeof h});
+    for (int b : j.blocks) s.push_back({be_.kv_host_ptr(j.a, b, false), bb});
+    for (int b : j.blocks) s.push_back({be_.kv_host_ptr(j.a, b, true), bb});
+    conn_.send(s.data(), static_cast<int>(s.size()));
+  } else {
+    // GPU cache: gather the layer's blocks into one host buffer, then send.
+    if (staging_.size() < 2 * n * bb) staging_.resize(2 * n * bb);
+    be_.read_kv_layer(j.a, j.blocks, staging_.data());
+    Slice s[2] = {{&h, sizeof h}, {staging_.data(), 2 * n * bb}};
+    conn_.send(s, 2);
+  }
+  std::lock_guard<std::mutex> lock(mu_);
+  stats_.kv_bytes += 2 * n * bb;
+}
+
+void KVSender::run() {
+  while (true) {
+    Job j;
+    {
+      std::unique_lock<std::mutex> lock(mu_);
+      cv_.wait(lock, [this] { return stop_ || !queue_.empty(); });
+      if (queue_.empty()) return;  // stop_ and nothing left
+      j = std::move(queue_.front());
+      queue_.pop_front();
+      busy_ = true;
+    }
+    try {
+      if (j.type == FrameType::Layer) {
+        send_layer(j);
+        if (on_layer_sent) on_layer_sent(j.request, j.a);
+      } else {
+        FrameHeader h = header(j.type, j.request, static_cast<std::uint32_t>(j.a), static_cast<std::uint32_t>(j.b),
+                               j.payload.size());
+        Slice s[2] = {{&h, sizeof h}, {j.payload.data(), j.payload.size()}};
+        conn_.send(s, 2);
+      }
+      if (j.on_sent) j.on_sent();
+      std::lock_guard<std::mutex> lock(mu_);
+      ++stats_.frames;
+      if (j.type == FrameType::End) ++stats_.requests;
+    } catch (...) {
+      std::lock_guard<std::mutex> lock(mu_);
+      error_ = std::current_exception();
+      // Free the blocks of everything still queued so the prefill worker does not leak.
+      if (j.on_sent && j.type == FrameType::End) j.on_sent();
+      for (auto& q : queue_)
+        if (q.on_sent) q.on_sent();
+      queue_.clear();
+      busy_ = false;
+      idle_cv_.notify_all();
+      return;
+    }
+    std::lock_guard<std::mutex> lock(mu_);
+    busy_ = false;
+    if (queue_.empty()) idle_cv_.notify_all();
+  }
+}
+
+// ---- receiver ---------------------------------------------------------------
+
+KVReceiver::KVReceiver(Engine& engine, Backend& backend, Connection& conn)
+    : engine_(engine), be_(backend), conn_(conn) {
+  thread_ = std::thread([this] { run(); });
+}
+
+KVReceiver::~KVReceiver() {
+  conn_.close();
+  if (thread_.joinable()) thread_.join();
+}
+
+void KVReceiver::join() {
+  if (thread_.joinable()) thread_.join();
+}
+
+TransferStats KVReceiver::stats() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return stats_;
+}
+
+std::exception_ptr KVReceiver::error() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return error_;
+}
+
+int KVReceiver::in_flight() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return static_cast<int>(incoming_.size());
+}
+
+void KVReceiver::run() {
+  bool hello = false;
+  try {
+    while (true) {
+      FrameHeader h;
+      conn_.recv(&h, sizeof h);
+      if (h.magic != kFrameMagic) throw std::runtime_error("kv transfer: bad frame magic");
+      if (!hello && h.type != static_cast<std::uint16_t>(FrameType::Hello))
+        throw std::runtime_error("kv transfer: the first frame must be Hello");
+      if (h.type == static_cast<std::uint16_t>(FrameType::Hello)) {
+        KVFingerprint theirs, ours = KVFingerprint::of(be_);
+        if (h.payload != sizeof theirs) throw std::runtime_error("kv transfer: bad Hello");
+        conn_.recv(&theirs, sizeof theirs);
+        if (!(theirs == ours))
+          throw std::runtime_error("kv transfer: the sender's model or KV cache layout differs from this worker's");
+        hello = true;
+        continue;
+      }
+      handle(h);
+      std::lock_guard<std::mutex> lock(mu_);
+      ++stats_.frames;
+    }
+  } catch (const ConnectionClosed&) {
+    // The peer went away (or we closed): fall through to cleanup.
+  } catch (...) {
+    std::lock_guard<std::mutex> lock(mu_);
+    error_ = std::current_exception();
+  }
+  // Requests whose End never arrived give their blocks back.
+  std::lock_guard<std::mutex> lock(mu_);
+  for (auto& [id, in] : incoming_)
+    if (!in.blocks.empty()) engine_.release_blocks(in.blocks);
+  incoming_.clear();
+}
+
+void KVReceiver::handle(const FrameHeader& h) {
+  switch (static_cast<FrameType>(h.type)) {
+    case FrameType::Begin: {
+      BeginInfo info;
+      if (h.payload < sizeof info) throw std::runtime_error("kv transfer: bad Begin");
+      conn_.recv(&info, sizeof info);
+      if (h.payload != sizeof info + info.prompt_len * sizeof(std::int32_t))
+        throw std::runtime_error("kv transfer: Begin payload size does not match its prompt length");
+      Incoming in;
+      in.req.id = h.request;
+      in.req.prompt.resize(info.prompt_len);
+      conn_.recv(in.req.prompt.data(), info.prompt_len * sizeof(std::int32_t));
+      in.req.params.max_new_tokens = info.max_new_tokens;
+      in.req.params.temperature = info.temperature;
+      in.req.params.top_p = info.top_p;
+      in.req.params.top_k = info.top_k;
+      in.req.params.seed = info.seed;
+      in.req.params.ignore_eos = info.ignore_eos != 0;
+      if (!engine_.try_reserve_for_transfer(static_cast<int>(info.num_blocks), in.blocks)) in.blocks.clear();
+      std::lock_guard<std::mutex> lock(mu_);
+      incoming_[h.request] = std::move(in);
+      break;
+    }
+    case FrameType::Layer: {
+      std::vector<int> dst;
+      {
+        std::lock_guard<std::mutex> lock(mu_);
+        auto it = incoming_.find(h.request);
+        if (it == incoming_.end()) throw std::runtime_error("kv transfer: Layer for an unknown request");
+        const std::size_t bb = be_.kv_block_bytes();
+        if (h.payload % (2 * bb) != 0) throw std::runtime_error("kv transfer: Layer payload is not whole blocks");
+        std::size_t n = h.payload / (2 * bb);
+        if (!it->second.blocks.empty()) {
+          if (h.b + n > it->second.blocks.size()) throw std::runtime_error("kv transfer: Layer beyond the request's blocks");
+          dst.assign(it->second.blocks.begin() + h.b, it->second.blocks.begin() + h.b + n);
+        }
+      }
+      const std::size_t bb = be_.kv_block_bytes();
+      if (dst.empty()) {  // no room for this request: read the bytes and drop them
+        if (staging_.size() < h.payload) staging_.resize(h.payload);
+        conn_.recv(staging_.data(), h.payload);
+        break;
+      }
+      if (be_.kv_host_ptr(static_cast<int>(h.a), dst[0], false)) {
+        // Host cache: read each block straight into place.
+        for (int b : dst) conn_.recv(be_.kv_host_ptr(static_cast<int>(h.a), b, false), bb);
+        for (int b : dst) conn_.recv(be_.kv_host_ptr(static_cast<int>(h.a), b, true), bb);
+      } else {
+        if (staging_.size() < h.payload) staging_.resize(h.payload);
+        conn_.recv(staging_.data(), h.payload);
+        be_.write_kv_layer(static_cast<int>(h.a), dst, staging_.data());
+      }
+      std::lock_guard<std::mutex> lock(mu_);
+      stats_.kv_bytes += h.payload;
+      break;
+    }
+    case FrameType::End: {
+      Incoming in;
+      {
+        std::lock_guard<std::mutex> lock(mu_);
+        auto it = incoming_.find(h.request);
+        if (it == incoming_.end()) throw std::runtime_error("kv transfer: End for an unknown request");
+        in = std::move(it->second);
+        incoming_.erase(it);
+        ++stats_.requests;
+      }
+      int first_token = static_cast<int>(h.a);
+      if (h.b) {
+        engine_.release_blocks(in.blocks);  // finished at its first token: nothing to decode
+      } else if (in.blocks.empty()) {
+        engine_.add_recompute(std::move(in.req), first_token);
+        std::lock_guard<std::mutex> lock(mu_);
+        ++stats_.recomputed;
+      } else {
+        engine_.add_prefilled(std::move(in.req), std::move(in.blocks), first_token);
+      }
+      if (on_ready) on_ready(h.request, first_token);
+      break;
+    }
+    case FrameType::Abort: {
+      std::lock_guard<std::mutex> lock(mu_);
+      auto it = incoming_.find(h.request);
+      if (it != incoming_.end()) {
+        if (!it->second.blocks.empty()) engine_.release_blocks(it->second.blocks);
+        incoming_.erase(it);
+      }
+      break;
+    }
+    default:
+      throw std::runtime_error("kv transfer: unknown frame type " + std::to_string(h.type));
+  }
+}
+
+// ---- prefill worker ---------------------------------------------------------
+
+PrefillWorker::PrefillWorker(Backend& backend, KVSender& sender, int max_batch_tokens)
+    : be_(backend), sender_(sender), budget_(max_batch_tokens), alloc_(backend.kv_layout().num_blocks) {}
+
+void PrefillWorker::add(Request r) {
+  if (r.prompt.empty()) throw std::invalid_argument("empty prompt");
+  if (be_.kv_layout().blocks_for(static_cast<int>(r.prompt.size())) > be_.kv_layout().num_blocks)
+    throw std::invalid_argument("prompt needs more KV blocks than the cache has");
+  queue_.push_back({std::move(r)});
+}
+
+bool PrefillWorker::has_work() const { return !queue_.empty(); }
+
+int PrefillWorker::free_blocks() const {
+  std::lock_guard<std::mutex> lock(alloc_mu_);
+  return alloc_.num_free();
+}
+
+std::vector<TokenEvent> PrefillWorker::step() {
+  const KVLayout& kv = be_.kv_layout();
+  ForwardBatch batch;
+  struct Member {
+    Pending* p;
+    int first_index, n_blocks;
+  };
+  std::vector<Member> members;
+  int budget = budget_;
+  // Prompts in arrival order; the one at the front may be part-way through.
+  for (Pending& p : queue_) {
+    if (budget == 0) break;
+    if (p.done) continue;
+    if (p.blocks.empty()) {
+      std::lock_guard<std::mutex> lock(alloc_mu_);
+      if (!alloc_.allocate(kv.blocks_for(static_cast<int>(p.req.prompt.size())), p.blocks)) break;
+    }
+    if (!p.begun) {
+      sender_.begin(p.req, static_cast<int>(p.blocks.size()));
+      p.begun = true;
+    }
+    int n = std::min(budget, static_cast<int>(p.req.prompt.size()) - p.computed);
+    std::vector<int> chunk(p.req.prompt.begin() + p.computed, p.req.prompt.begin() + p.computed + n);
+    bool last = p.computed + n == static_cast<int>(p.req.prompt.size());
+    batch.seqs.push_back({std::move(chunk), p.computed, p.blocks, last});
+    int first_block = p.computed / kv.block_size, end_block = kv.blocks_for(p.computed + n);
+    members.push_back({&p, first_block, end_block - first_block});
+    budget -= n;
+  }
+  if (batch.seqs.empty()) return {};
+
+  // Stream each layer's new blocks as soon as the backend reports them written.
+  struct Streamer : LayerObserver {
+    KVSender* sender;
+    std::vector<Member>* members;
+    void kv_written(int layer) override {
+      for (const Member& m : *members) {
+        std::vector<int> blocks(m.p->blocks.begin() + m.first_index, m.p->blocks.begin() + m.first_index + m.n_blocks);
+        sender->layer(m.p->req.id, layer, m.first_index, std::move(blocks));
+      }
+    }
+  } streamer;
+  streamer.sender = &sender_;
+  streamer.members = &members;
+  std::vector<float> logits = be_.forward(batch, stream_layers ? &streamer : nullptr);
+  if (!stream_layers)
+    for (int l = 0; l < be_.config().layers; ++l) streamer.kv_written(l);
+
+  std::vector<TokenEvent> events;
+  const int V = be_.config().vocab;
+  const auto& eos = be_.config().eos_ids;
+  int row = 0;
+  for (std::size_t i = 0; i < members.size(); ++i) {
+    Pending* p = members[i].p;
+    p->computed += static_cast<int>(batch.seqs[i].tokens.size());
+    if (!batch.seqs[i].want_logits) continue;
+    const float* lg = logits.data() + static_cast<std::size_t>(row++) * V;
+    if (on_logits) on_logits(p->req.id, lg);
+    int tok = sample(lg, V, p->req.params, 0);
+    bool stop = !p->req.params.ignore_eos && std::find(eos.begin(), eos.end(), tok) != eos.end();
+    bool finished = stop || p->req.params.max_new_tokens <= 1;
+    events.push_back({p->req.id, tok, 0, stop ? Finish::Stop : finished ? Finish::Length : Finish::None});
+    // The blocks go back to the pool only once the sender has sent every frame that
+    // reads them.
+    auto blocks = std::make_shared<std::vector<int>>(std::move(p->blocks));
+    sender_.end(p->req.id, tok, finished, [this, blocks] {
+      std::lock_guard<std::mutex> lock(alloc_mu_);
+      alloc_.release_all(*blocks);
+    });
+    p->done = true;
+  }
+  for (auto it = queue_.begin(); it != queue_.end();) it = it->done ? queue_.erase(it) : it + 1;
+  return events;
+}
+
+}  // namespace relay

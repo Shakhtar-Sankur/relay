@@ -79,6 +79,42 @@ Hugging Face with a tolerance instead.
 gives back its blocks and is recomputed later. Swapping to host memory is the other
 option; recompute is simpler and, with prefill being fast, usually competitive.
 
+## Decisions in M2: the KV transfer engine
+
+**Stream per layer, in the forward pass.** The backend calls `LayerObserver::kv_written(l)`
+as soon as layer l's K and V are in the cache (CPU: after the writes; CUDA: after an event
+is recorded on the compute stream). The prefill worker queues "send layer l of these
+blocks" for a sender thread, which waits on that event (`wait_kv_written`) and puts the
+bytes on the wire while the backend computes layer l + 1. Only the last layers' transfer
+remains after the forward pass ends.
+
+**Block ids stay local.** Frames say "the request's i-th block", never a block id. Each
+worker maps that to its own allocation, so the two caches can be sized and fragmented
+independently.
+
+**Zero copies on the host path.** With the cache in host memory, the sender hands the
+socket a list of pointers into the cache (one `sendmsg`), and the receiver reads each
+block straight into its slot. A GPU cache is gathered into a host buffer on a separate copy
+stream (so it never waits for the forward pass), sent, and written back with
+`cudaMemcpyAsync` on the receiver's copy stream. GPU-to-GPU on one machine (CUDA IPC) and
+RDMA are left for the multi-GPU milestone, where there is hardware to measure them on.
+
+**The receiver never blocks the stream.** Several requests share one ordered connection.
+If the receiver waited for cache room for request B, it would also hold up A's remaining
+frames, and A's blocks are what B needs: a deadlock (the first version of the tests found
+it). So a reservation succeeds only when nothing is queued and every running request keeps a
+free block; otherwise the request's KV frames are read and dropped, and the decode engine
+recomputes the prompt, the same path as preemption. Deterministic sampling makes the
+output identical either way.
+
+**Failures release memory.** A connection that breaks mid-transfer (the prefill worker
+died) makes the receiver return the blocks of every incomplete request. A prefill worker
+frees a request's blocks only after its last frame is on the wire. M5 builds recovery on
+these.
+
+**Two transports.** TCP between machines; a shared-memory ring (one SPSC byte ring per
+direction, acquire/release counters) between processes on one machine.
+
 ## Milestones
 
 | | Milestone | Proof |

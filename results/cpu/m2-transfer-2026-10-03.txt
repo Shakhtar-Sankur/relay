@@ -1,0 +1,30 @@
+# relay-transfer-bench on this repo's development container: 4 vCPU, Linux 6.18, commit before M2 push
+# raw: sender and receiver in separate processes, about 1 GiB per message size
+transport tcp, sender and receiver in separate processes
+   message   messages       GB/s
+        4K     262144       0.65
+       64K      16384       2.37
+     1024K       1024       2.01
+    16384K         64       1.75
+transport shm, sender and receiver in separate processes
+   message   messages       GB/s
+        4K     262144       5.23
+       64K      16384       8.56
+     1024K       1024       6.60
+    16384K         64       5.57
+
+# stream: SmolLM2-135M, CPU backend (float32), median of 3 after one warm-up
+model models/smollm2-135m, cpu backend, tcp transport, 512-token prompt, 30 layers, 23.59 MB of KV cache
+                          forward      ready    exposed
+send after forward      2246.48ms  2252.99ms     6.51ms
+stream layer by layer   2247.07ms  2247.12ms     0.05ms
+transfer: 23.59 MB; after-forward exposed time is 3.62 GB/s effective
+hidden by streaming: 99% of the exposed transfer time
+
+model models/smollm2-135m, cpu backend, shm transport, 512-token prompt, 30 layers, 23.59 MB of KV cache
+                          forward      ready    exposed
+send after forward      2870.42ms  2887.29ms    16.87ms
+stream layer by layer   2364.17ms  2364.54ms     0.37ms
+transfer: 23.59 MB; after-forward exposed time is 1.40 GB/s effective
+hidden by streaming: 98% of the exposed transfer time
+

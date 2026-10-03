@@ -6,6 +6,11 @@
 // the paged cache, SiLU-and-multiply. The attention kernel is deliberately simple
 // (one thread block per token and head, scores in shared memory); M1 replaces it with
 // a paged decode kernel and a flash-style prefill kernel.
+//
+// Streams: the forward pass runs on its own stream; KV block reads and writes (the
+// transfer engine's traffic) run on a second one, so a transfer never waits for the
+// forward pass to finish. An event recorded after each layer's KV write tells the
+// transfer engine when that layer can be read (wait_kv_written).
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -239,7 +244,12 @@ class CudaBackend final : public Backend {
   CudaBackend(const HostWeights& w, int num_blocks, int block_size, int device, int max_tokens, int max_context)
       : c_(w.config), max_tokens_(max_tokens), max_context_(max_context) {
     CUDA_CHECK(cudaSetDevice(device));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking));
     CUBLAS_CHECK(cublasCreate(&cublas_));
+    CUBLAS_CHECK(cublasSetStream(cublas_, stream_));
+    layer_done_.resize(c_.layers);
+    for (auto& e : layer_done_) CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
     layout_ = {c_.layers, c_.kv_heads, c_.head_dim, block_size, num_blocks};
 
     // Attention keeps one float per visible position in shared memory.
@@ -290,6 +300,9 @@ class CudaBackend final : public Backend {
 
   ~CudaBackend() override {
     if (cublas_) cublasDestroy(cublas_);
+    for (auto e : layer_done_) cudaEventDestroy(e);
+    if (stream_) cudaStreamDestroy(stream_);
+    if (copy_stream_) cudaStreamDestroy(copy_stream_);
   }
 
   const ModelConfig& config() const override { return c_; }
@@ -298,18 +311,26 @@ class CudaBackend final : public Backend {
   std::size_t kv_block_bytes() const override { return static_cast<std::size_t>(layout_.block_elems()) * 2; }
 
   void read_kv_block(int layer, int block, void* k_out, void* v_out) override {
-    std::size_t off = static_cast<std::size_t>(layer * layout_.layer_elems() + block * layout_.block_elems());
-    CUDA_CHECK(cudaMemcpy(k_out, kc_.p + off, kv_block_bytes(), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(v_out, vc_.p + off, kv_block_bytes(), cudaMemcpyDeviceToHost));
+    read_kv_layer(layer, {block}, nullptr, k_out, v_out);
   }
 
   void write_kv_block(int layer, int block, const void* k_in, const void* v_in) override {
-    std::size_t off = static_cast<std::size_t>(layer * layout_.layer_elems() + block * layout_.block_elems());
-    CUDA_CHECK(cudaMemcpy(kc_.p + off, k_in, kv_block_bytes(), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(vc_.p + off, v_in, kv_block_bytes(), cudaMemcpyHostToDevice));
+    write_kv_layer(layer, {block}, k_in, v_in);
   }
 
-  std::vector<float> forward(const ForwardBatch& batch) override {
+  void read_kv_layer(int layer, const std::vector<int>& blocks, void* out) override {
+    auto* k = static_cast<unsigned char*>(out);
+    read_kv_layer(layer, blocks, nullptr, k, k + blocks.size() * kv_block_bytes());
+  }
+
+  void write_kv_layer(int layer, const std::vector<int>& blocks, const void* in) override {
+    const auto* k = static_cast<const unsigned char*>(in);
+    write_kv_layer(layer, blocks, k, k + blocks.size() * kv_block_bytes());
+  }
+
+  void wait_kv_written(int layer) override { CUDA_CHECK(cudaEventSynchronize(layer_done_.at(layer))); }
+
+  std::vector<float> forward(const ForwardBatch& batch, LayerObserver* observer) override {
     const int H = c_.hidden, Q = c_.q_dim(), KV = c_.kv_dim(), I = c_.intermediate, D = c_.head_dim, V = c_.vocab;
     const int QKV = Q + 2 * KV;
 
@@ -336,47 +357,74 @@ class CudaBackend final : public Backend {
     if (T > max_tokens_) throw std::invalid_argument("batch has more tokens than max_batch_tokens");
     if (tables.size() > tables_.n) tables_ = DeviceArray<int>(tables.size() * 2);
     if (table_off.size() > table_off_.n) table_off_ = DeviceArray<int>(table_off.size() * 2);
-    tokens_.upload(tok.data(), T);
-    pos_.upload(pos.data(), T);
-    seq_.upload(seq.data(), T);
-    table_off_.upload(table_off.data(), table_off.size());
-    tables_.upload(tables.data(), tables.size());
-    if (R) rows_.upload(rows.data(), R);
+    upload(tokens_, tok);
+    upload(pos_, pos);
+    upload(seq_, seq);
+    upload(table_off_, table_off);
+    upload(tables_, tables);
+    if (R) upload(rows_, rows);
     TokenMeta meta{pos_.p, seq_.p, table_off_.p, tables_.p};
 
     const float eps = static_cast<float>(c_.rms_eps), scale = 1.0f / std::sqrt(static_cast<float>(D));
     const std::size_t smem = static_cast<std::size_t>(max_context_ + D) * sizeof(float);
 
-    embed_kernel<<<T, 256>>>(tokens_.p, embed_.p, x_.p, H);
+    embed_kernel<<<T, 256, 0, stream_>>>(tokens_.p, embed_.p, x_.p, H);
     for (int l = 0; l < c_.layers; ++l) {
       DeviceLayer& L = layers_[l];
       __half* kc = kc_.p + static_cast<std::size_t>(l) * layout_.layer_elems();
       __half* vc = vc_.p + static_cast<std::size_t>(l) * layout_.layer_elems();
-      rmsnorm_kernel<<<T, 256>>>(x_.p, nullptr, L.attn_norm.p, xn_.p, H, eps);
+      rmsnorm_kernel<<<T, 256, 0, stream_>>>(x_.p, nullptr, L.attn_norm.p, xn_.p, H, eps);
       gemm(L.wqkv.p, xn_.p, qkv_.p, T, H, QKV, 0.0f);
-      qkv_post_kernel<<<T, 256>>>(qkv_.p, L.bqkv.n ? L.bqkv.p : nullptr, inv_freq_.p, meta, kc, vc, c_.heads,
+      qkv_post_kernel<<<T, 256, 0, stream_>>>(qkv_.p, L.bqkv.n ? L.bqkv.p : nullptr, inv_freq_.p, meta, kc, vc, c_.heads,
                                   c_.kv_heads, D, layout_.block_size);
-      attention_kernel<<<dim3(T, c_.heads), 128, smem>>>(qkv_.p, meta, kc, vc, attn_.p, c_.heads, c_.kv_heads, D,
+      CUDA_CHECK(cudaEventRecord(layer_done_[l], stream_));
+      if (observer) observer->kv_written(l);
+      attention_kernel<<<dim3(T, c_.heads), 128, smem, stream_>>>(qkv_.p, meta, kc, vc, attn_.p, c_.heads, c_.kv_heads, D,
                                                          layout_.block_size, scale);
       gemm(L.wo.p, attn_.p, x_.p, T, Q, H, 1.0f);  // x += attn @ wo^T
-      rmsnorm_kernel<<<T, 256>>>(x_.p, nullptr, L.mlp_norm.p, xn_.p, H, eps);
+      rmsnorm_kernel<<<T, 256, 0, stream_>>>(x_.p, nullptr, L.mlp_norm.p, xn_.p, H, eps);
       gemm(L.w_gate_up.p, xn_.p, gu_.p, T, H, 2 * I, 0.0f);
-      silu_mul_kernel<<<T, 256>>>(gu_.p, act_.p, I);
+      silu_mul_kernel<<<T, 256, 0, stream_>>>(gu_.p, act_.p, I);
       gemm(L.w_down.p, act_.p, x_.p, T, I, H, 1.0f);  // x += act @ w_down^T
     }
     std::vector<float> out(static_cast<std::size_t>(R) * V);
     if (R) {
-      rmsnorm_kernel<<<R, 256>>>(x_.p, rows_.p, final_norm_.p, xn_.p, H, eps);
+      rmsnorm_kernel<<<R, 256, 0, stream_>>>(x_.p, rows_.p, final_norm_.p, xn_.p, H, eps);
       gemm(lm_head_.n ? lm_head_.p : embed_.p, xn_.p, logits_.p, R, H, V, 0.0f);
       CUDA_CHECK(cudaGetLastError());
-      CUDA_CHECK(cudaMemcpy(out.data(), logits_.p, out.size() * sizeof(float), cudaMemcpyDeviceToHost));
-    } else {
-      CUDA_CHECK(cudaDeviceSynchronize());
+      CUDA_CHECK(cudaMemcpyAsync(out.data(), logits_.p, out.size() * sizeof(float), cudaMemcpyDeviceToHost, stream_));
     }
+    CUDA_CHECK(cudaStreamSynchronize(stream_));
     return out;
   }
 
  private:
+  void upload(DeviceArray<int>& d, const std::vector<int>& h) {
+    if (h.size() > d.n) throw std::logic_error("metadata larger than its device buffer");
+    CUDA_CHECK(cudaMemcpyAsync(d.p, h.data(), h.size() * sizeof(int), cudaMemcpyHostToDevice, stream_));
+  }
+
+  // K blocks to k_out and V blocks to v_out, on the copy stream.
+  void read_kv_layer(int layer, const std::vector<int>& blocks, void*, void* k_out, void* v_out) {
+    const std::size_t bb = kv_block_bytes();
+    for (std::size_t i = 0; i < blocks.size(); ++i) {
+      std::size_t off = static_cast<std::size_t>(layer * layout_.layer_elems() + blocks[i] * layout_.block_elems());
+      CUDA_CHECK(cudaMemcpyAsync(static_cast<char*>(k_out) + i * bb, kc_.p + off, bb, cudaMemcpyDeviceToHost, copy_stream_));
+      CUDA_CHECK(cudaMemcpyAsync(static_cast<char*>(v_out) + i * bb, vc_.p + off, bb, cudaMemcpyDeviceToHost, copy_stream_));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
+  }
+
+  void write_kv_layer(int layer, const std::vector<int>& blocks, const void* k_in, const void* v_in) {
+    const std::size_t bb = kv_block_bytes();
+    for (std::size_t i = 0; i < blocks.size(); ++i) {
+      std::size_t off = static_cast<std::size_t>(layer * layout_.layer_elems() + blocks[i] * layout_.block_elems());
+      CUDA_CHECK(cudaMemcpyAsync(kc_.p + off, static_cast<const char*>(k_in) + i * bb, bb, cudaMemcpyHostToDevice, copy_stream_));
+      CUDA_CHECK(cudaMemcpyAsync(vc_.p + off, static_cast<const char*>(v_in) + i * bb, bb, cudaMemcpyHostToDevice, copy_stream_));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
+  }
+
   // y[T, N] = x[T, K] @ W[N, K]^T + beta * y. Row-major y is column-major y^T (N x T),
   // which is W (column-major K x N, transposed) times x (column-major K x T).
   void gemm(const __half* W, const __half* x, float* y, int T, int K, int N, float beta) {
@@ -389,6 +437,8 @@ class CudaBackend final : public Backend {
   KVLayout layout_;
   int max_tokens_, max_context_;
   cublasHandle_t cublas_ = nullptr;
+  cudaStream_t stream_ = nullptr, copy_stream_ = nullptr;
+  std::vector<cudaEvent_t> layer_done_;
   DeviceArray<__half> embed_, lm_head_;
   DeviceArray<float> final_norm_, inv_freq_;
   std::vector<DeviceLayer> layers_;

@@ -22,7 +22,69 @@ Engine::Engine(Backend& backend, EngineOptions options)
 
 Engine::~Engine() = default;
 
+bool Engine::has_work() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return has_work_locked();
+}
+
+EngineStats Engine::stats() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return stats_;
+}
+
+int Engine::free_blocks() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return alloc_.num_free();
+}
+
+bool Engine::reserve_blocks(int n, std::vector<int>& out) {
+  std::lock_guard<std::mutex> lock(mu_);
+  return alloc_.allocate(n, out);
+}
+
+bool Engine::try_reserve_for_transfer(int n, std::vector<int>& out) {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (!waiting_.empty()) return false;
+  if (alloc_.num_free() < n + static_cast<int>(running_.size())) return false;
+  return alloc_.allocate(n, out);
+}
+
+void Engine::add_recompute(Request request, int first_token) {
+  std::lock_guard<std::mutex> lock(mu_);
+  const KVLayout& kv = backend_.kv_layout();
+  if (kv.blocks_for(static_cast<int>(request.prompt.size()) + request.params.max_new_tokens) > kv.num_blocks)
+    throw std::invalid_argument("request needs more KV blocks than the cache has");
+  auto s = std::make_unique<Seq>();
+  s->tokens = request.prompt;
+  s->tokens.push_back(first_token);
+  s->generated = 1;
+  s->req = std::move(request);
+  waiting_.push_back(std::move(s));
+}
+
+void Engine::release_blocks(std::vector<int>& blocks) {
+  std::lock_guard<std::mutex> lock(mu_);
+  alloc_.release_all(blocks);
+}
+
+void Engine::add_prefilled(Request request, std::vector<int> blocks, int first_token) {
+  std::lock_guard<std::mutex> lock(mu_);
+  const KVLayout& kv = backend_.kv_layout();
+  if (static_cast<int>(blocks.size()) < kv.blocks_for(static_cast<int>(request.prompt.size())))
+    throw std::invalid_argument("add_prefilled: blocks do not cover the prompt");
+  auto s = std::make_unique<Seq>();
+  s->tokens = request.prompt;
+  s->tokens.push_back(first_token);
+  s->computed = static_cast<int>(request.prompt.size());
+  s->generated = 1;
+  s->blocks = std::move(blocks);
+  s->req = std::move(request);
+  s->admit_order = ++admitted_;
+  running_.push_back(std::move(s));
+}
+
 void Engine::add(Request request) {
+  std::lock_guard<std::mutex> lock(mu_);
   const KVLayout& kv = backend_.kv_layout();
   int longest = static_cast<int>(request.prompt.size()) + request.params.max_new_tokens;
   if (request.prompt.empty()) throw std::invalid_argument("empty prompt");
@@ -60,6 +122,11 @@ Engine::Seq* Engine::youngest_running() {
 }
 
 std::vector<TokenEvent> Engine::step() {
+  std::lock_guard<std::mutex> lock(mu_);
+  return step_locked();
+}
+
+std::vector<TokenEvent> Engine::step_locked() {
   ForwardBatch batch;
   std::vector<Seq*> members;
   int budget = opt_.max_batch_tokens;
@@ -120,7 +187,7 @@ std::vector<TokenEvent> Engine::step() {
 
   std::vector<TokenEvent> events;
   if (batch.seqs.empty()) {
-    if (has_work() && running_.empty() && preempted.empty())
+    if (has_work_locked() && running_.empty() && preempted.empty())
       throw std::runtime_error("engine stalled: the next request does not fit in the KV cache");
     return events;
   }

@@ -18,7 +18,8 @@ CUDA, written from scratch.
 ```
 
 Why and how: [`docs/design.md`](docs/design.md). Code walkthrough with interview
-questions: [`docs/m0-walkthrough.md`](docs/m0-walkthrough.md).
+questions: [`docs/m0-walkthrough.md`](docs/m0-walkthrough.md) (engine),
+[`docs/m2-walkthrough.md`](docs/m2-walkthrough.md) (KV transfer).
 
 ## Status
 
@@ -26,7 +27,7 @@ questions: [`docs/m0-walkthrough.md`](docs/m0-walkthrough.md).
 |---|---|---|
 | M0 | Engine core: Llama-architecture models (Llama 2/3.x, TinyLlama, SmolLM2, Qwen2), float32 CPU reference backend, CUDA backend (fp16, cuBLAS), paged KV cache, continuous batching with chunked prefill and preemption | done |
 | M1 | CUDA kernels: paged decode attention, flash-style prefill, fused RMSNorm/RoPE, int8 weights | |
-| M2 | KV transfer engine: layer-by-layer streaming, CUDA IPC, zero-copy TCP | |
+| M2 | KV transfer engine: layer-by-layer streaming during the forward pass, zero-copy TCP and shared-memory transports, recompute fallback under memory pressure | done on CPU; GPU run pending |
 | M3 | Swift control plane: Swift↔C++ interop, gRPC, OpenAI API, tokenizer | |
 | M4 | Disaggregated scheduling: prefix-cache-aware routing, prefill/decode pools, admission | |
 | M5 | Fault tolerance and deterministic cluster simulation | |
@@ -54,6 +55,26 @@ The batching tests pass on both backends; bit for bit on the CPU backend: a requ
 batch of eight, with its prompt in 7-token chunks, after being preempted and recomputed,
 with any block size, and when its KV blocks are copied to a second backend that continues
 decoding (disaggregation in miniature).
+
+## The KV transfer engine (M2)
+
+A request prefilled on one backend and decoded on another, with its KV cache streamed
+between them over TCP or shared memory, produces exactly the tokens of one engine doing
+everything, and on the CPU backend exactly the same logits: with chunked prefill, with
+the decode side out of memory (it falls back to recomputing the prompt), for sampled and
+greedy requests. A sender that dies mid-transfer gives every reserved block back; a sender
+running a different model is refused. The threaded code runs clean under ThreadSanitizer.
+
+Measured on the 4-vCPU development container
+([`results/cpu/m2-transfer-2026-10-03.txt`](results/cpu/m2-transfer-2026-10-03.txt)):
+
+| | |
+|---|---|
+| Raw throughput between two processes | shared memory 6-8 GB/s; TCP over loopback 1.7-3.6 GB/s |
+| SmolLM2-135M, 512-token prompt (23.6 MB of KV cache), transfer time left after the prefill forward pass | sent after the pass: 6.5 ms (TCP), 16.9 ms (shm); streamed per layer: 0.05 ms and 0.37 ms, 98-99% hidden |
+
+On CPU the forward pass takes 2.3 s, so the transfer is small next to it either way; the
+GPU run (`scripts/colab_m2.sh`), where prefill is far faster, is the test that matters.
 
 ## Build and test
 

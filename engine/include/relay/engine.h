@@ -11,8 +11,11 @@
 // recomputed later from its prompt and the tokens it has generated so far. Because
 // sampling depends only on (seed, token index), it then produces the same tokens.
 //
-// In the cluster (M3-M5) a worker runs one of these; the Swift control plane decides
-// which requests it gets.
+// In the cluster a worker runs one of these; the Swift control plane decides which
+// requests it gets. A decode worker also receives requests whose prompt another worker
+// already processed (add_prefilled), with their KV cache arriving through the KV
+// transfer engine. The public methods are thread-safe: the transfer engine's receiver
+// thread reserves blocks and adds requests while another thread calls step().
 #pragma once
 
 #include <cstdint>
@@ -20,6 +23,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -62,13 +66,30 @@ class Engine {
 
   // Throws std::invalid_argument if the prompt could never fit in the cache.
   void add(Request request);
-  bool has_work() const { return !waiting_.empty() || !running_.empty(); }
+  bool has_work() const;
   std::vector<TokenEvent> step();
   // Runs until every request has finished; returns the generated tokens per request.
   std::map<std::uint64_t, std::vector<int>> run_all();
 
-  const EngineStats& stats() const { return stats_; }
-  int free_blocks() const { return alloc_.num_free(); }
+  // Takes n free blocks out of the pool for a request that is being transferred in;
+  // false (and nothing taken) if fewer than n are free.
+  bool reserve_blocks(int n, std::vector<int>& out);
+  // The transfer engine's reservation: succeeds only if nothing is queued and, after it,
+  // every running request still has a free block to grow into. Under memory pressure
+  // the receiver therefore falls back to recompute instead of starving running requests.
+  bool try_reserve_for_transfer(int n, std::vector<int>& out);
+  void release_blocks(std::vector<int>& blocks);
+  // Adds a request whose prompt was processed elsewhere: `blocks` (from reserve_blocks)
+  // hold the KV cache of every prompt token, and `first_token` is the token the prefill
+  // worker sampled (index 0). The request continues with token index 1.
+  void add_prefilled(Request request, std::vector<int> blocks, int first_token);
+  // Adds a request whose first token was sampled elsewhere but whose KV cache did not
+  // come with it: the prompt is recomputed here (as after a preemption), then decoding
+  // continues with token index 1. Same tokens either way: sampling is deterministic.
+  void add_recompute(Request request, int first_token);
+
+  EngineStats stats() const;
+  int free_blocks() const;
 
   // Called with the logits each generated token was sampled from (tests use it to
   // compare runs bit for bit).
@@ -76,10 +97,13 @@ class Engine {
 
  private:
   struct Seq;
+  std::vector<TokenEvent> step_locked();
+  bool has_work_locked() const { return !waiting_.empty() || !running_.empty(); }
   bool ensure_blocks(Seq& s, int tokens);
   void preempt(Seq& s);
   Seq* youngest_running();
 
+  mutable std::mutex mu_;
   Backend& backend_;
   EngineOptions opt_;
   BlockAllocator alloc_;

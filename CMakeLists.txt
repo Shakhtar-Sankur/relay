@@ -11,20 +11,24 @@ option(RELAY_CUDA "Build the CUDA backend" OFF)
 option(RELAY_NATIVE "Optimize for this machine's CPU" ON)
 
 find_package(OpenMP REQUIRED)
+find_package(Threads REQUIRED)
 
 add_library(relay_engine
   engine/src/json.cpp
   engine/src/safetensors.cpp
   engine/src/config.cpp
   engine/src/weights.cpp
+  engine/src/backend.cpp
   engine/src/kv_cache.cpp
   engine/src/cpu_backend.cpp
   engine/src/sampler.cpp
   engine/src/engine.cpp
+  engine/src/transport.cpp
+  engine/src/kv_transfer.cpp
 )
 target_include_directories(relay_engine PUBLIC engine/include)
-target_link_libraries(relay_engine PUBLIC OpenMP::OpenMP_CXX)
-target_compile_options(relay_engine PRIVATE -Wall -Wextra -Wno-unused-parameter)
+target_link_libraries(relay_engine PUBLIC OpenMP::OpenMP_CXX Threads::Threads)
+target_compile_options(relay_engine PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers>)
 if(RELAY_NATIVE)
   target_compile_options(relay_engine PRIVATE -march=native)
 endif()
@@ -42,9 +46,11 @@ endif()
 
 add_executable(relay-generate tools/relay_generate.cpp)
 target_link_libraries(relay-generate PRIVATE relay_engine)
+add_executable(relay-transfer-bench tools/relay_transfer_bench.cpp)
+target_link_libraries(relay-transfer-bench PRIVATE relay_engine)
 
 enable_testing()
-foreach(t safetensors kv_cache reference batching sampler)
+foreach(t safetensors kv_cache reference batching sampler transfer)
   add_executable(test_${t} tests/test_${t}.cpp)
   target_link_libraries(test_${t} PRIVATE relay_engine)
   target_compile_definitions(test_${t} PRIVATE RELAY_FIXTURES="${CMAKE_SOURCE_DIR}/tests/fixtures")

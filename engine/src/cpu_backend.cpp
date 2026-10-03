@@ -83,7 +83,12 @@ class CpuBackend final : public Backend {
     std::memcpy(v_.data() + off, v_in, kv_block_bytes());
   }
 
-  std::vector<float> forward(const ForwardBatch& batch) override {
+  void* kv_host_ptr(int layer, int block, bool value) override {
+    std::int64_t off = layer * layout_.layer_elems() + block * layout_.block_elems();
+    return (value ? v_.data() : k_.data()) + off;
+  }
+
+  std::vector<float> forward(const ForwardBatch& batch, LayerObserver* observer) override {
     const int H = c_.hidden, Q = c_.q_dim(), KV = c_.kv_dim(), I = c_.intermediate, D = c_.head_dim;
     const int QKV = Q + 2 * KV;
 
@@ -141,6 +146,9 @@ class CpuBackend final : public Backend {
           std::memcpy(Vc + off, row + Q + KV + h * D, D * 4);
         }
       }
+      // This layer's K and V for the whole batch are in the cache; nothing later in
+      // this forward pass writes them, so they can be sent while the next layers run.
+      if (observer) observer->kv_written(l);
 
       // Causal attention: the token at position p sees positions 0..p of its own sequence.
 #pragma omp parallel for collapse(2) schedule(dynamic)

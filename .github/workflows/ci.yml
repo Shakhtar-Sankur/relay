@@ -13,8 +13,20 @@ jobs:
       - run: sudo apt-get install -y --no-install-recommends ninja-build
       - run: cmake -S . -B build -G Ninja -DRELAY_NATIVE=OFF
       - run: cmake --build build
-      - name: tests (logits against Hugging Face on 4 tiny models; batching, chunking, preemption and KV-block moves bit for bit)
+      - name: tests (logits against Hugging Face on 4 tiny models; batching, chunking, preemption bit for bit; prefill/decode split over TCP and shared memory bit for bit)
         run: ctest --test-dir build --output-on-failure
+
+  thread-sanitizer:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - run: sudo apt-get install -y --no-install-recommends ninja-build
+      - run: cmake -S . -B build -G Ninja -DRELAY_NATIVE=OFF -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_FLAGS=-fsanitize=thread -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread
+      - run: cmake --build build --target test_transfer test_batching
+      - name: the threaded code (sender, receiver, engine) under ThreadSanitizer
+        run: |
+          OMP_NUM_THREADS=1 TSAN_OPTIONS=halt_on_error=1 ./build/test_transfer
+          OMP_NUM_THREADS=1 TSAN_OPTIONS=halt_on_error=1 ./build/test_batching
 
   cuda-compiles:
     runs-on: ubuntu-24.04
