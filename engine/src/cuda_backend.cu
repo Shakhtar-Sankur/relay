@@ -1,11 +1,15 @@
-// The CUDA backend (M0 version): fp16 weights and KV cache, fp32 residual stream.
+// The CUDA backend: fp16 weights (or int8, optionally) and KV cache, fp32 residual stream.
 //
 // Matrix multiplies go to cuBLAS (fp16 inputs, fp32 accumulation and output; the
 // residual adds are folded into the GEMM with beta = 1). Everything else is a small
-// kernel here: embedding lookup, RMSNorm, bias + RoPE + KV-cache write, attention over
-// the paged cache, SiLU-and-multiply. The attention kernel is deliberately simple
-// (one thread block per token and head, scores in shared memory); M1 replaces it with
-// a paged decode kernel and a flash-style prefill kernel.
+// kernel: embedding lookup, RMSNorm, bias + RoPE + KV-cache write, attention over the
+// paged cache, SiLU-and-multiply.
+//
+// Attention (M1, cuda_kernels.cuh): chunks of several tokens (prefill) go to a
+// flash-style kernel on tensor cores; single tokens (decode) to a kernel that splits the
+// context across blocks and merges the slices. The M0 kernel (one block per token and
+// head, every score in shared memory) remains as the reference the tests compare
+// against, and for head sizes the M1 kernels do not cover.
 //
 // Streams: the forward pass runs on its own stream; KV block reads and writes (the
 // transfer engine's traffic) run on a second one, so a transfer never waits for the
@@ -15,17 +19,31 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 
+#include <cstdlib>
+
+#include "cuda_kernels.cuh"
 #include "relay/backend.h"
 #include "relay/safetensors.h"
 
 namespace relay {
+
+CudaOptions CudaOptions::from_env() {
+  CudaOptions o;
+  if (const char* a = std::getenv("RELAY_CUDA_ATTENTION")) o.reference_attention = std::string(a) == "m0";
+  if (const char* q = std::getenv("RELAY_CUDA_INT8")) o.int8_weights = std::string(q) == "1";
+  return o;
+}
+
 namespace {
+
+using kernels::TokenMeta;
 
 #define CUDA_CHECK(x)                                                                                    \
   do {                                                                                                   \
@@ -140,13 +158,6 @@ __global__ void rmsnorm_kernel(const float* x, const int* rows, const float* w, 
     out[static_cast<long long>(r) * H + i] = __float2half(w[i] * (xr[i] * inv));
 }
 
-struct TokenMeta {
-  const int* pos;         // [T]
-  const int* seq;         // [T] chunk index of each token
-  const int* table_off;   // [S] offset of each chunk's block table in tables
-  const int* tables;      // concatenated block tables
-};
-
 // Adds the q/k/v bias, applies RoPE to q (in place) and k, and writes k and v into
 // the paged cache at the token's position.
 __global__ void qkv_post_kernel(float* qkv, const float* bias, const float* inv_freq, TokenMeta m, __half* kc,
@@ -252,15 +263,48 @@ __global__ void kv_scatter_kernel(uint4* k, uint4* v, const int* blocks, int n, 
 
 // ---- backend ----------------------------------------------------------------
 
+// A weight matrix [N, K]: fp16, or int8 with one scale per row.
+struct DeviceMatrix {
+  int N = 0, K = 0;
+  DeviceArray<__half> f16;
+  DeviceArray<std::int8_t> i8;
+  DeviceArray<float> scale;
+};
+
+DeviceMatrix to_device_matrix(const std::vector<float>& w, int N, int K, bool int8) {
+  DeviceMatrix m;
+  m.N = N;
+  m.K = K;
+  if (!int8) {
+    m.f16 = to_device_f16(w);
+    return m;
+  }
+  std::vector<std::int8_t> q(w.size());
+  std::vector<float> sc(N);
+  for (int n = 0; n < N; ++n) {
+    float mx = 0.0f;
+    for (int k = 0; k < K; ++k) mx = std::max(mx, std::fabs(w[static_cast<std::size_t>(n) * K + k]));
+    sc[n] = mx > 0.0f ? mx / 127.0f : 1.0f;
+    for (int k = 0; k < K; ++k)
+      q[static_cast<std::size_t>(n) * K + k] =
+          static_cast<std::int8_t>(std::lrintf(w[static_cast<std::size_t>(n) * K + k] / sc[n]));
+  }
+  m.i8 = DeviceArray<std::int8_t>(q.size());
+  m.i8.upload(q.data(), q.size());
+  m.scale = to_device_f32(sc);
+  return m;
+}
+
 struct DeviceLayer {
   DeviceArray<float> attn_norm, mlp_norm, bqkv;
-  DeviceArray<__half> wqkv, wo, w_gate_up, w_down;
+  DeviceMatrix wqkv, wo, w_gate_up, w_down;
 };
 
 class CudaBackend final : public Backend {
  public:
-  CudaBackend(const HostWeights& w, int num_blocks, int block_size, int device, int max_tokens, int max_context)
-      : c_(w.config), max_tokens_(max_tokens), max_context_(max_context) {
+  CudaBackend(const HostWeights& w, int num_blocks, int block_size, int device, int max_tokens, int max_context,
+              CudaOptions options)
+      : c_(w.config), opt_(options), max_tokens_(max_tokens), max_context_(max_context) {
     CUDA_CHECK(cudaSetDevice(device));
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
     CUDA_CHECK(cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking));
@@ -271,19 +315,23 @@ class CudaBackend final : public Backend {
     layout_ = {c_.layers, c_.kv_heads, c_.head_dim, block_size, num_blocks};
     if (kv_block_bytes() % 16 != 0) throw std::invalid_argument("a KV block must be a multiple of 16 bytes");
 
-    // Attention keeps one float per visible position in shared memory.
-    std::size_t smem = static_cast<std::size_t>(max_context_ + c_.head_dim) * sizeof(float);
+    const int D = c_.head_dim, G = c_.heads / c_.kv_heads;
+    fast_attention_ = !opt_.reference_attention && (D == 16 || D == 32 || D == 64) && G >= 1 && G <= 8 &&
+                      block_size * D * 2 % 16 == 0;
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
-    if (smem > prop.sharedMemPerBlockOptin)
-      throw std::invalid_argument("max_context too long for this GPU's shared memory (M1's kernel lifts this)");
+    // The M0 kernel keeps one float per visible position in shared memory.
+    std::size_t smem = static_cast<std::size_t>(max_context_ + c_.head_dim) * sizeof(float);
+    if (!fast_attention_ && smem > prop.sharedMemPerBlockOptin)
+      throw std::invalid_argument("max_context too long for the reference attention kernel's shared memory");
+    if (fast_attention_) smem = 0;
     // The limit belongs to the kernel, for the whole process, not to this backend: only
     // ever raise it, or a second backend with a shorter context would break the first.
     {
       static std::mutex mu;
       static std::size_t current = 0;
       std::lock_guard<std::mutex> lock(mu);
-      if (smem > current) {
+      if (smem > current && !fast_attention_) {
         CUDA_CHECK(cudaFuncSetAttribute(attention_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                         static_cast<int>(smem)));
         current = smem;
@@ -299,10 +347,13 @@ class CudaBackend final : public Backend {
       d.attn_norm = to_device_f32(L.attn_norm);
       d.mlp_norm = to_device_f32(L.mlp_norm);
       d.bqkv = to_device_f32(L.bqkv);
-      d.wqkv = to_device_f16(L.wqkv);
-      d.wo = to_device_f16(L.wo);
-      d.w_gate_up = to_device_f16(L.w_gate_up);
-      d.w_down = to_device_f16(L.w_down);
+      const int H = c_.hidden, QKV = c_.q_dim() + 2 * c_.kv_dim(), I = c_.intermediate;
+      const bool q8 = opt_.int8_weights;
+      d.wqkv = to_device_matrix(L.wqkv, QKV, H, q8);
+      d.wo = to_device_matrix(L.wo, H, c_.q_dim(), q8);
+      d.w_gate_up = to_device_matrix(L.w_gate_up, 2 * I, H, q8);
+      d.w_down = to_device_matrix(L.w_down, H, I, q8);
+      if (q8) dequant_elems_ = std::max({dequant_elems_, d.wqkv.i8.n, d.wo.i8.n, d.w_gate_up.i8.n, d.w_down.i8.n});
       layers_.push_back(std::move(d));
     }
     kc_ = DeviceArray<__half>(static_cast<std::size_t>(layout_.layer_elems()) * c_.layers);
@@ -325,6 +376,9 @@ class CudaBackend final : public Backend {
     rows_ = DeviceArray<int>(T);
     table_off_ = DeviceArray<int>(T);
     tables_ = DeviceArray<int>(T + static_cast<std::size_t>(num_blocks) * 4 + 1024);
+    decode_tokens_ = DeviceArray<int>(T);
+    prefill_tiles_ = DeviceArray<int2>(T);
+    if (opt_.int8_weights) dequant_ = DeviceArray<__half>(dequant_elems_);
   }
 
   ~CudaBackend() override {
@@ -361,8 +415,7 @@ class CudaBackend final : public Backend {
   void wait_kv_written(int layer) override { CUDA_CHECK(cudaEventSynchronize(layer_done_.at(layer))); }
 
   std::vector<float> forward(const ForwardBatch& batch, LayerObserver* observer) override {
-    const int H = c_.hidden, Q = c_.q_dim(), KV = c_.kv_dim(), I = c_.intermediate, D = c_.head_dim, V = c_.vocab;
-    const int QKV = Q + 2 * KV;
+    const int H = c_.hidden, Q = c_.q_dim(), I = c_.intermediate, D = c_.head_dim, V = c_.vocab;
 
     std::vector<int> tok, pos, seq, table_off, tables, rows;
     for (int s = 0; s < static_cast<int>(batch.seqs.size()); ++s) {
@@ -384,6 +437,24 @@ class CudaBackend final : public Backend {
     }
     const int T = static_cast<int>(tok.size()), R = static_cast<int>(rows.size());
     if (T == 0) return {};
+    // Which attention kernel each token goes through: single-token chunks to the decode
+    // kernel, longer chunks to the prefill kernel in tiles of up to 64 rows.
+    std::vector<int> decode;
+    std::vector<int2> tiles;
+    int max_ctx = 0;
+    if (fast_attention_) {
+      int t = 0;
+      for (const SeqChunk& ch : batch.seqs) {
+        const int n = static_cast<int>(ch.tokens.size());
+        if (n == 1) {
+          decode.push_back(t);
+          max_ctx = std::max(max_ctx, ch.start_pos + 1);
+        } else {
+          for (int r = 0; r < n; r += kernels::kFlashRows) tiles.push_back(make_int2(t + r, std::min(kernels::kFlashRows, n - r)));
+        }
+        t += n;
+      }
+    }
     if (T > max_tokens_) throw std::invalid_argument("batch has more tokens than max_batch_tokens");
     if (tables.size() > tables_.n) tables_ = DeviceArray<int>(tables.size() * 2);
     if (table_off.size() > table_off_.n) table_off_ = DeviceArray<int>(table_off.size() * 2);
@@ -393,10 +464,21 @@ class CudaBackend final : public Backend {
     upload(table_off_, table_off);
     upload(tables_, tables);
     if (R) upload(rows_, rows);
+    if (!decode.empty()) upload(decode_tokens_, decode);
+    if (!tiles.empty()) {
+      if (tiles.size() > prefill_tiles_.n) throw std::logic_error("more prefill tiles than tokens");
+      CUDA_CHECK(cudaMemcpyAsync(prefill_tiles_.p, tiles.data(), tiles.size() * sizeof(int2), cudaMemcpyHostToDevice, stream_));
+    }
+    const int parts = decode.empty() ? 0 : (max_ctx + kernels::kDecodeSlice - 1) / kernels::kDecodeSlice;
+    if (!decode.empty()) {
+      const std::size_t need = decode.size() * static_cast<std::size_t>(c_.heads) * parts;
+      if (need * D > part_o_.n) part_o_ = DeviceArray<float>(need * D * 2);
+      if (need * 2 > part_ml_.n) part_ml_ = DeviceArray<float>(need * 4);
+    }
     TokenMeta meta{pos_.p, seq_.p, table_off_.p, tables_.p};
 
     const float eps = static_cast<float>(c_.rms_eps), scale = 1.0f / std::sqrt(static_cast<float>(D));
-    const std::size_t smem = static_cast<std::size_t>(max_context_ + D) * sizeof(float);
+    const std::size_t smem = fast_attention_ ? 0 : static_cast<std::size_t>(max_context_ + D) * sizeof(float);
 
     embed_kernel<<<T, 256, 0, stream_>>>(tokens_.p, embed_.p, x_.p, H);
     for (int l = 0; l < c_.layers; ++l) {
@@ -404,18 +486,22 @@ class CudaBackend final : public Backend {
       __half* kc = kc_.p + static_cast<std::size_t>(l) * layout_.layer_elems();
       __half* vc = vc_.p + static_cast<std::size_t>(l) * layout_.layer_elems();
       rmsnorm_kernel<<<T, 256, 0, stream_>>>(x_.p, nullptr, L.attn_norm.p, xn_.p, H, eps);
-      gemm(L.wqkv.p, xn_.p, qkv_.p, T, H, QKV, 0.0f);
+      gemm(L.wqkv, xn_.p, qkv_.p, T, 0.0f);
       qkv_post_kernel<<<T, 256, 0, stream_>>>(qkv_.p, L.bqkv.n ? L.bqkv.p : nullptr, inv_freq_.p, meta, kc, vc, c_.heads,
                                   c_.kv_heads, D, layout_.block_size);
       CUDA_CHECK(cudaEventRecord(layer_done_[l], stream_));
       if (observer) observer->kv_written(l);
-      attention_kernel<<<dim3(T, c_.heads), 128, smem, stream_>>>(qkv_.p, meta, kc, vc, attn_.p, c_.heads, c_.kv_heads, D,
-                                                         layout_.block_size, scale);
-      gemm(L.wo.p, attn_.p, x_.p, T, Q, H, 1.0f);  // x += attn @ wo^T
+      if (fast_attention_) {
+        attention_m1(meta, decode, tiles, parts, kc, vc, scale);
+      } else {
+        attention_kernel<<<dim3(T, c_.heads), 128, smem, stream_>>>(qkv_.p, meta, kc, vc, attn_.p, c_.heads,
+                                                                    c_.kv_heads, D, layout_.block_size, scale);
+      }
+      gemm(L.wo, attn_.p, x_.p, T, 1.0f);  // x += attn @ wo^T
       rmsnorm_kernel<<<T, 256, 0, stream_>>>(x_.p, nullptr, L.mlp_norm.p, xn_.p, H, eps);
-      gemm(L.w_gate_up.p, xn_.p, gu_.p, T, H, 2 * I, 0.0f);
+      gemm(L.w_gate_up, xn_.p, gu_.p, T, 0.0f);
       silu_mul_kernel<<<T, 256, 0, stream_>>>(gu_.p, act_.p, I);
-      gemm(L.w_down.p, act_.p, x_.p, T, I, H, 1.0f);  // x += act @ w_down^T
+      gemm(L.w_down, act_.p, x_.p, T, 1.0f);  // x += act @ w_down^T
     }
     std::vector<float> out(static_cast<std::size_t>(R) * V);
     if (R) {
@@ -489,6 +575,64 @@ class CudaBackend final : public Backend {
     CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
   }
 
+  void attention_m1(const TokenMeta& meta, const std::vector<int>& decode, const std::vector<int2>& tiles, int parts,
+                    const __half* kc, const __half* vc, float scale) {
+    const int D = c_.head_dim, G = c_.heads / c_.kv_heads, bs = layout_.block_size;
+    if (!tiles.empty()) {
+      dim3 grid(static_cast<unsigned>(tiles.size()), c_.heads);
+      switch (D) {
+        case 16: launch_flash<16>(grid, meta, kc, vc, bs, scale); break;
+        case 32: launch_flash<32>(grid, meta, kc, vc, bs, scale); break;
+        case 64: launch_flash<64>(grid, meta, kc, vc, bs, scale); break;
+      }
+    }
+    if (!decode.empty()) {
+      dim3 grid(static_cast<unsigned>(decode.size()), c_.kv_heads, parts);
+      switch (D) {
+        case 16: launch_decode<16>(G, grid, meta, kc, vc, bs, scale, parts); break;
+        case 32: launch_decode<32>(G, grid, meta, kc, vc, bs, scale, parts); break;
+        case 64: launch_decode<64>(G, grid, meta, kc, vc, bs, scale, parts); break;
+      }
+      kernels::decode_combine_kernel<<<dim3(static_cast<unsigned>(decode.size()), c_.heads), D, 0, stream_>>>(
+          part_o_.p, part_ml_.p, decode_tokens_.p, attn_.p, c_.heads, D, parts);
+    }
+  }
+
+  template <int D>
+  void launch_flash(dim3 grid, const TokenMeta& meta, const __half* kc, const __half* vc, int bs, float scale) {
+    kernels::flash_prefill_kernel<D><<<grid, kernels::kFlashWarps * 32, kernels::flash_smem_bytes<D>(), stream_>>>(
+        qkv_.p, meta, prefill_tiles_.p, kc, vc, attn_.p, c_.heads, c_.kv_heads, bs, scale);
+  }
+
+  template <int D>
+  void launch_decode(int G, dim3 grid, const TokenMeta& meta, const __half* kc, const __half* vc, int bs, float scale,
+                     int parts) {
+#define RELAY_DECODE(g)                                                                                         \
+  case g:                                                                                                       \
+    kernels::decode_attention_kernel<D, g><<<grid, kernels::kDecodeThreads, 0, stream_>>>(                     \
+        qkv_.p, meta, decode_tokens_.p, kc, vc, part_o_.p, part_ml_.p, c_.heads, c_.kv_heads, bs, scale, parts); \
+    break;
+    switch (G) {
+      RELAY_DECODE(1) RELAY_DECODE(2) RELAY_DECODE(3) RELAY_DECODE(4)
+      RELAY_DECODE(5) RELAY_DECODE(6) RELAY_DECODE(7) RELAY_DECODE(8)
+    }
+#undef RELAY_DECODE
+  }
+
+  // y[T, N] = x[T, K] @ W[N, K]^T + beta * y, with W fp16 or int8.
+  void gemm(const DeviceMatrix& W, const __half* x, float* y, int T, float beta) {
+    if (!W.i8.p) return gemm(W.f16.p, x, y, T, W.K, W.N, beta);
+    if (T <= kernels::kInt8MaxTokens) {
+      const int warps = 8;
+      kernels::gemv_int8_kernel<kernels::kInt8MaxTokens><<<(W.N + warps - 1) / warps, warps * 32, 0, stream_>>>(
+          W.i8.p, W.scale.p, x, y, T, W.K, W.N, beta);
+      return;
+    }
+    const long long total = static_cast<long long>(W.N) * W.K;
+    kernels::dequant_int8_kernel<<<1024, 256, 0, stream_>>>(W.i8.p, W.scale.p, dequant_.p, W.K, total);
+    gemm(dequant_.p, x, y, T, W.K, W.N, beta);
+  }
+
   // y[T, N] = x[T, K] @ W[N, K]^T + beta * y. Row-major y is column-major y^T (N x T),
   // which is W (column-major K x N, transposed) times x (column-major K x T).
   void gemm(const __half* W, const __half* x, float* y, int T, int K, int N, float beta) {
@@ -498,6 +642,9 @@ class CudaBackend final : public Backend {
   }
 
   ModelConfig c_;
+  CudaOptions opt_;
+  bool fast_attention_ = false;
+  std::size_t dequant_elems_ = 0;
   KVLayout layout_;
   int max_tokens_, max_context_;
   cublasHandle_t cublas_ = nullptr;
@@ -515,13 +662,17 @@ class CudaBackend final : public Backend {
   DeviceArray<float> x_, qkv_, gu_, logits_;
   DeviceArray<__half> xn_, attn_, act_;
   DeviceArray<int> tokens_, pos_, seq_, rows_, table_off_, tables_;
+  DeviceArray<int> decode_tokens_;
+  DeviceArray<int2> prefill_tiles_;
+  DeviceArray<float> part_o_, part_ml_;  // decode slices' partial outputs and (max, sum)
+  DeviceArray<__half> dequant_;          // int8 weights dequantized for a large batch
 };
 
 }  // namespace
 
 std::unique_ptr<Backend> make_cuda_backend(const HostWeights& weights, int num_blocks, int block_size, int device,
-                                           int max_batch_tokens, int max_context) {
-  return std::make_unique<CudaBackend>(weights, num_blocks, block_size, device, max_batch_tokens, max_context);
+                                           int max_batch_tokens, int max_context, CudaOptions options) {
+  return std::make_unique<CudaBackend>(weights, num_blocks, block_size, device, max_batch_tokens, max_context, options);
 }
 
 }  // namespace relay

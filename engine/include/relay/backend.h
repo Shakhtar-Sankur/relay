@@ -74,8 +74,19 @@ class Backend {
 
 std::unique_ptr<Backend> make_cpu_backend(const HostWeights& weights, int num_blocks, int block_size);
 #ifdef RELAY_CUDA
+struct CudaOptions {
+  // The M0 attention kernel everywhere instead of M1's paged decode and flash prefill
+  // kernels (tests compare the two; also the fallback for head sizes M1 does not cover).
+  bool reference_attention = false;
+  // Weight-only int8 for the transformer layers (one scale per output row): half the
+  // weight memory and bandwidth. Approximate: logits are no longer fp16-exact.
+  bool int8_weights = false;
+  // Defaults from the environment: RELAY_CUDA_ATTENTION=m0, RELAY_CUDA_INT8=1.
+  static CudaOptions from_env();
+};
 std::unique_ptr<Backend> make_cuda_backend(const HostWeights& weights, int num_blocks, int block_size, int device,
-                                           int max_batch_tokens, int max_context);
+                                           int max_batch_tokens, int max_context,
+                                           CudaOptions options = CudaOptions::from_env());
 #endif
 
 }  // namespace relay
