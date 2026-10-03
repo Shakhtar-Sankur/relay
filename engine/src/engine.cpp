@@ -54,15 +54,20 @@ bool Engine::try_reserve_for_transfer(int n, std::vector<int>& out) {
   return alloc_.allocate(n, out);
 }
 
-void Engine::add_recompute(Request request, int first_token) {
+void Engine::add_recompute(Request request, int first_token) { add_resume(std::move(request), {first_token}); }
+
+void Engine::add_resume(Request request, const std::vector<int>& generated) {
   std::lock_guard<std::mutex> lock(mu_);
   const KVLayout& kv = backend_.kv_layout();
+  if (request.prompt.empty()) throw std::invalid_argument("empty prompt");
   if (kv.blocks_for(static_cast<int>(request.prompt.size()) + request.params.max_new_tokens) > kv.num_blocks)
     throw std::invalid_argument("request needs more KV blocks than the cache has");
+  if (static_cast<int>(generated.size()) >= request.params.max_new_tokens)
+    throw std::invalid_argument("resume: the request has already generated all its tokens");
   auto s = std::make_unique<Seq>();
   s->tokens = request.prompt;
-  s->tokens.push_back(first_token);
-  s->generated = 1;
+  s->tokens.insert(s->tokens.end(), generated.begin(), generated.end());
+  s->generated = static_cast<int>(generated.size());
   s->req = std::move(request);
   waiting_.push_back(std::move(s));
 }

@@ -22,11 +22,12 @@ jobs:
       - uses: actions/checkout@v5
       - run: sudo apt-get install -y --no-install-recommends ninja-build
       - run: cmake -S . -B build -G Ninja -DRELAY_NATIVE=OFF -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_FLAGS=-fsanitize=thread -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread
-      - run: cmake --build build --target test_transfer test_batching
+      - run: cmake --build build --target test_transfer test_batching test_worker
       - name: the threaded code (sender, receiver, engine) under ThreadSanitizer
         run: |
           OMP_NUM_THREADS=1 TSAN_OPTIONS=halt_on_error=1 ./build/test_transfer
           OMP_NUM_THREADS=1 TSAN_OPTIONS=halt_on_error=1 ./build/test_batching
+          OMP_NUM_THREADS=1 TSAN_OPTIONS=halt_on_error=1 ./build/test_worker
 
   swift:
     runs-on: ubuntu-24.04

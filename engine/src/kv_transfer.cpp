@@ -26,7 +26,8 @@ FrameHeader header(FrameType t, std::uint64_t request, std::uint32_t a, std::uin
 
 // ---- sender -----------------------------------------------------------------
 
-KVSender::KVSender(Backend& backend, Connection& conn) : be_(backend), conn_(conn) {
+KVSender::KVSender(Backend& backend, Connection& conn, std::function<void(std::uint64_t, int)> on_layer_sent)
+    : on_layer_sent(std::move(on_layer_sent)), be_(backend), conn_(conn) {
   KVFingerprint fp = KVFingerprint::of(be_);
   Job hello{FrameType::Hello};
   hello.payload.resize(sizeof fp);
@@ -76,7 +77,11 @@ void KVSender::end(std::uint64_t request, int first_token, bool finished, std::f
   push(std::move(j));
 }
 
-void KVSender::abort(std::uint64_t request) { push(Job{FrameType::Abort, request}); }
+void KVSender::abort(std::uint64_t request, std::function<void()> on_sent) {
+  Job j{FrameType::Abort, request};
+  j.on_sent = std::move(on_sent);
+  push(std::move(j));
+}
 
 void KVSender::flush() {
   std::unique_lock<std::mutex> lock(mu_);
@@ -141,7 +146,7 @@ void KVSender::run() {
       std::lock_guard<std::mutex> lock(mu_);
       error_ = std::current_exception();
       // Free the blocks of everything still queued so the prefill worker does not leak.
-      if (j.on_sent && j.type == FrameType::End) j.on_sent();
+      if (j.on_sent) j.on_sent();
       for (auto& q : queue_)
         if (q.on_sent) q.on_sent();
       queue_.clear();
@@ -157,8 +162,9 @@ void KVSender::run() {
 
 // ---- receiver ---------------------------------------------------------------
 
-KVReceiver::KVReceiver(Engine& engine, Backend& backend, Connection& conn)
-    : engine_(engine), be_(backend), conn_(conn) {
+KVReceiver::KVReceiver(Engine& engine, Backend& backend, Connection& conn,
+                       std::function<void(std::uint64_t, int)> on_ready)
+    : on_ready(std::move(on_ready)), engine_(engine), be_(backend), conn_(conn) {
   thread_ = std::thread([this] { run(); });
 }
 
@@ -316,7 +322,7 @@ void KVReceiver::handle(const FrameHeader& h) {
 
 // ---- prefill worker ---------------------------------------------------------
 
-PrefillWorker::PrefillWorker(Backend& backend, KVSender& sender, int max_batch_tokens, bool prefix_caching)
+PrefillWorker::PrefillWorker(Backend& backend, KVSender* sender, int max_batch_tokens, bool prefix_caching)
     : be_(backend),
       sender_(sender),
       budget_(max_batch_tokens),
@@ -327,11 +333,35 @@ PrefillStats PrefillWorker::stats() const {
   return stats_;
 }
 
-void PrefillWorker::add(Request r) {
+void PrefillWorker::add(Request r, KVSender* to) {
   if (r.prompt.empty()) throw std::invalid_argument("empty prompt");
   if (be_.kv_layout().blocks_for(static_cast<int>(r.prompt.size())) > be_.kv_layout().num_blocks)
     throw std::invalid_argument("prompt needs more KV blocks than the cache has");
-  queue_.push_back({std::move(r)});
+  Pending p;
+  p.req = std::move(r);
+  p.sender = to ? to : sender_;
+  if (!p.sender) throw std::invalid_argument("prefill: no destination for the request's KV cache");
+  queue_.push_back(std::move(p));
+}
+
+bool PrefillWorker::cancel(std::uint64_t id) {
+  for (auto it = queue_.begin(); it != queue_.end(); ++it) {
+    if (it->req.id != id || it->done) continue;
+    // Queued Layer frames may still read the blocks: free them once the Abort is sent.
+    auto blocks = std::make_shared<std::vector<int>>(std::move(it->blocks));
+    if (it->begun) {
+      it->sender->abort(id, [this, blocks] {
+        std::lock_guard<std::mutex> lock(alloc_mu_);
+        alloc_.release_all(*blocks);
+      });
+    } else {
+      std::lock_guard<std::mutex> lock(alloc_mu_);
+      alloc_.release_all(*blocks);
+    }
+    queue_.erase(it);
+    return true;
+  }
+  return false;
 }
 
 bool PrefillWorker::has_work() const { return !queue_.empty(); }
@@ -370,13 +400,13 @@ std::vector<TokenEvent> PrefillWorker::step() {
       stats_.prefix_hit_tokens += static_cast<std::uint64_t>(p.computed);
     }
     if (!p.begun) {
-      sender_.begin(p.req, static_cast<int>(p.blocks.size()));
+      p.sender->begin(p.req, static_cast<int>(p.blocks.size()));
       p.begun = true;
       // Blocks that came from the prefix cache are complete already: send them now.
       int cached = p.computed / kv.block_size;
       if (cached > 0)
         for (int l = 0; l < kv.layers; ++l)
-          sender_.layer(p.req.id, l, 0, std::vector<int>(p.blocks.begin(), p.blocks.begin() + cached));
+          p.sender->layer(p.req.id, l, 0, std::vector<int>(p.blocks.begin(), p.blocks.begin() + cached));
     }
     int n = std::min(budget, static_cast<int>(p.req.prompt.size()) - p.computed);
     std::vector<int> chunk(p.req.prompt.begin() + p.computed, p.req.prompt.begin() + p.computed + n);
@@ -390,16 +420,14 @@ std::vector<TokenEvent> PrefillWorker::step() {
 
   // Stream each layer's new blocks as soon as the backend reports them written.
   struct Streamer : LayerObserver {
-    KVSender* sender;
     std::vector<Member>* members;
     void kv_written(int layer) override {
       for (const Member& m : *members) {
         std::vector<int> blocks(m.p->blocks.begin() + m.first_index, m.p->blocks.begin() + m.first_index + m.n_blocks);
-        sender->layer(m.p->req.id, layer, m.first_index, std::move(blocks));
+        m.p->sender->layer(m.p->req.id, layer, m.first_index, std::move(blocks));
       }
     }
   } streamer;
-  streamer.sender = &sender_;
   streamer.members = &members;
   std::vector<float> logits = be_.forward(batch, stream_layers ? &streamer : nullptr);
   if (!stream_layers)
@@ -427,7 +455,7 @@ std::vector<TokenEvent> PrefillWorker::step() {
     // The blocks go back to the pool only once the sender has sent every frame that
     // reads them.
     auto blocks = std::make_shared<std::vector<int>>(std::move(p->blocks));
-    sender_.end(p->req.id, tok, finished, [this, blocks] {
+    p->sender->end(p->req.id, tok, finished, [this, blocks] {
       std::lock_guard<std::mutex> lock(alloc_mu_);
       alloc_.release_all(*blocks);
     });

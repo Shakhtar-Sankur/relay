@@ -78,7 +78,9 @@ struct TransferStats {
 // Prefill side: queues frames and sends them from its own thread.
 class KVSender {
  public:
-  KVSender(Backend& backend, Connection& conn);
+  // on_layer_sent runs on the sender thread after each Layer frame is written:
+  // (request, layer). Given here, before the thread starts, so it is never raced.
+  KVSender(Backend& backend, Connection& conn, std::function<void(std::uint64_t, int)> on_layer_sent = nullptr);
   ~KVSender();  // sends what is queued, then stops
 
   void begin(const Request& r, int num_blocks);
@@ -88,15 +90,14 @@ class KVSender {
   void layer(std::uint64_t request, int layer, int first_index, std::vector<int> blocks);
   // on_sent runs on the sender thread once every earlier frame of the request is out.
   void end(std::uint64_t request, int first_token, bool finished, std::function<void()> on_sent);
-  void abort(std::uint64_t request);
+  void abort(std::uint64_t request, std::function<void()> on_sent = nullptr);
   // Waits until everything queued so far has been sent; rethrows a send error.
   void flush();
 
   TransferStats stats() const;
-  // Called on the sender thread after each Layer frame is written: (request, layer).
-  std::function<void(std::uint64_t, int)> on_layer_sent;
 
  private:
+  std::function<void(std::uint64_t, int)> on_layer_sent;
   struct Job {
     FrameType type;
     std::uint64_t request = 0;
@@ -132,17 +133,19 @@ class KVSender {
 // are read and dropped and the engine recomputes its prompt (add_recompute).
 class KVReceiver {
  public:
-  KVReceiver(Engine& engine, Backend& backend, Connection& conn);
+  // on_ready runs on the receiver thread when a request is complete and handed to the
+  // engine. Given here, before the thread starts, so it is never raced.
+  KVReceiver(Engine& engine, Backend& backend, Connection& conn,
+             std::function<void(std::uint64_t request, int first_token)> on_ready = nullptr);
   ~KVReceiver();  // closes the connection and joins
   void join();    // waits for the peer to close the connection
 
   TransferStats stats() const;
   std::exception_ptr error() const;
   int in_flight() const;
-  // Called on the receiver thread when a request is complete and handed to the engine.
-  std::function<void(std::uint64_t request, int first_token)> on_ready;
 
  private:
+  std::function<void(std::uint64_t request, int first_token)> on_ready;
   struct Incoming {
     Request req;
     std::vector<int> blocks;  // empty: no room, the KV cache is being discarded
@@ -173,8 +176,14 @@ struct PrefillStats {
 
 class PrefillWorker {
  public:
-  PrefillWorker(Backend& backend, KVSender& sender, int max_batch_tokens, bool prefix_caching = true);
-  void add(Request r);
+  // `sender` is the default destination for requests added without one (may be null).
+  PrefillWorker(Backend& backend, KVSender* sender, int max_batch_tokens, bool prefix_caching = true);
+  PrefillWorker(Backend& backend, KVSender& sender, int max_batch_tokens, bool prefix_caching = true)
+      : PrefillWorker(backend, &sender, max_batch_tokens, prefix_caching) {}
+  // `to` is the decode worker's connection for this request (the constructor's sender
+  // when null). A prefill worker can serve several decode workers.
+  void add(Request r, KVSender* to = nullptr);
+  bool cancel(std::uint64_t id);
   bool has_work() const;
   std::vector<TokenEvent> step();
   int free_blocks() const;
@@ -188,6 +197,7 @@ class PrefillWorker {
  private:
   struct Pending {
     Request req;
+    KVSender* sender = nullptr;
     std::vector<int> blocks;
     std::vector<std::uint64_t> hashes;
     int computed = 0;
@@ -195,7 +205,7 @@ class PrefillWorker {
     bool done = false;
   };
   Backend& be_;
-  KVSender& sender_;
+  KVSender* sender_;
   int budget_;
   mutable std::mutex alloc_mu_;  // the sender thread frees blocks
   BlockManager alloc_;

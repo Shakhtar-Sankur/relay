@@ -25,6 +25,7 @@ add_library(relay_engine
   engine/src/engine.cpp
   engine/src/transport.cpp
   engine/src/kv_transfer.cpp
+  engine/src/worker.cpp
 )
 target_include_directories(relay_engine PUBLIC engine/include)
 target_link_libraries(relay_engine PUBLIC OpenMP::OpenMP_CXX Threads::Threads)
@@ -46,11 +47,13 @@ endif()
 
 add_executable(relay-generate tools/relay_generate.cpp)
 target_link_libraries(relay-generate PRIVATE relay_engine)
+add_executable(relay-worker tools/relay_worker.cpp)
+target_link_libraries(relay-worker PRIVATE relay_engine)
 add_executable(relay-transfer-bench tools/relay_transfer_bench.cpp)
 target_link_libraries(relay-transfer-bench PRIVATE relay_engine)
 
 enable_testing()
-foreach(t safetensors kv_cache reference batching sampler transfer)
+foreach(t safetensors kv_cache reference batching sampler transfer worker)
   add_executable(test_${t} tests/test_${t}.cpp)
   target_link_libraries(test_${t} PRIVATE relay_engine)
   target_compile_definitions(test_${t} PRIVATE RELAY_FIXTURES="${CMAKE_SOURCE_DIR}/tests/fixtures")

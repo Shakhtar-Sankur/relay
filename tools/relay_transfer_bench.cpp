@@ -145,13 +145,12 @@ int stream(const std::string& model, const std::string& backend, const std::stri
       std::condition_variable cv;
       bool is_ready = false;
       Clock::time_point t_ready;
-      KVReceiver rx(decode, *db, *p.rx);
-      rx.on_ready = [&](std::uint64_t, int) {
+      KVReceiver rx(decode, *db, *p.rx, [&](std::uint64_t, int) {
         std::lock_guard<std::mutex> lock(mu);
         t_ready = Clock::now();
         is_ready = true;
         cv.notify_all();
-      };
+      });
       KVSender tx(*pb, *p.tx);
       tx.flush();  // Hello out of the way
       PrefillWorker pw(*pb, tx, prompt_len);

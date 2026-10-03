@@ -91,6 +91,10 @@ class Engine {
   // come with it: the prompt is recomputed here (as after a preemption), then decoding
   // continues with token index 1. Same tokens either way: sampling is deterministic.
   void add_recompute(Request request, int first_token);
+  // The general form: a request that has already produced `generated` (by any worker)
+  // continues here with token index generated.size(), after recomputing its prompt and
+  // those tokens. This is how a request survives the loss of the worker that ran it.
+  void add_resume(Request request, const std::vector<int>& generated);
   // Drops a request wherever it is (queued or running) and frees its blocks; false if
   // the engine does not have it (already finished, or never added).
   bool cancel(std::uint64_t id);
