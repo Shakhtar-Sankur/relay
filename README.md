@@ -133,9 +133,15 @@ TinyLlama-1.1B, prefill on one backend and decode on another in one process:
 Streaming hides 99-100% of the transfer. The first T4 run hid 1-14% at 0.5 GB/s
 ([`results/t4/m2-2026-10-03-first-run.txt`](results/t4/m2-2026-10-03-first-run.txt)): each
 layer was 64 small copies into pageable memory, which cannot overlap kernels. A gather
-kernel and one copy per layer into page-locked memory fixed it. The forward pass times are
-M0's attention kernel, which M1 replaces; a faster prefill leaves less time to hide the
-transfer in, so these numbers will be re-measured after M1.
+kernel and one copy per layer into page-locked memory fixed it.
+
+Re-measured with M1's kernels, whose prefill is about 9x shorter, so there is far less compute
+to hide the transfer behind: streaming still hides 99-100%. For 2,048 tokens the forward pass
+is now 384-386 ms, and the 46 MB that would be exposed for 29.3 ms (TCP) or 54.3 ms (shm) if
+sent afterwards costs under 0.01 ms and 0.04 ms streamed; for 512 tokens, 7.2 ms and 13.7 ms
+become 0.05 ms and 0.13 ms
+([`results/t4/m2-2026-10-04-m1-kernels.txt`](results/t4/m2-2026-10-04-m1-kernels.txt)).
+Each layer's prefill still takes longer than sending its KV cache, so the transfer fits.
 
 ## The Swift control plane (M3)
 

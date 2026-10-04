@@ -85,6 +85,14 @@ std::vector<Request> make_requests(int vocab) {
   return rs;
 }
 
+// Tokens arrive from two threads (the prefill worker emits each request's first token, the
+// decode worker the rest), so arrival order is not token order: place each by its index.
+void put(std::map<std::uint64_t, std::vector<int>>& out, const TokenEvent& e) {
+  std::vector<int>& v = out[e.id];
+  if (static_cast<int>(v.size()) <= e.index) v.resize(e.index + 1, -1);
+  v[e.index] = e.token;
+}
+
 using Log = std::map<std::pair<std::uint64_t, int>, std::vector<float>>;
 
 // One engine does everything.
@@ -124,7 +132,7 @@ std::map<std::uint64_t, std::vector<int>> disaggregated(const HostWeights& w, co
       while (pw.has_work())
         for (const TokenEvent& e : pw.step()) {
           std::lock_guard<std::mutex> lock(log_mu);
-          out[e.id].push_back(e.token);
+          put(out, e);
           if (e.finish != Finish::None) --unfinished;
         }
       sender.flush();
@@ -136,7 +144,7 @@ std::map<std::uint64_t, std::vector<int>> disaggregated(const HostWeights& w, co
       if (events.empty()) std::this_thread::sleep_for(std::chrono::microseconds(100));
       for (const TokenEvent& e : events) {
         std::lock_guard<std::mutex> lock(log_mu);
-        out[e.id].push_back(e.token);
+        put(out, e);
         if (e.finish != Finish::None) --unfinished;
       }
     }
@@ -150,6 +158,18 @@ std::map<std::uint64_t, std::vector<int>> disaggregated(const HostWeights& w, co
   CHECK_EQ(decode.free_blocks(), decode_blocks);
   if (dstats) *dstats = decode.stats();
   return out;
+}
+
+void dump_diff(const std::map<std::uint64_t, std::vector<int>>& a, const std::map<std::uint64_t, std::vector<int>>& b) {
+  for (const auto& [id, v] : a) {
+    auto it = b.find(id);
+    if (it != b.end() && it->second == v) continue;
+    std::fprintf(stderr, "  DIFF id %llu colocated:", (unsigned long long)id);
+    for (int t : v) std::fprintf(stderr, " %d", t);
+    std::fprintf(stderr, " | disagg:");
+    if (it != b.end()) for (int t : it->second) std::fprintf(stderr, " %d", t);
+    std::fprintf(stderr, "\n");
+  }
 }
 
 void compare(const Log& a, const Log& b) {
@@ -219,6 +239,7 @@ TEST(disaggregated_over_tcp_equals_colocated) {
   TransferStats ts;
   auto a = colocated(w, rs, one);
   auto b = disaggregated(w, rs, tcp_pair(), two, 512, 64, &ts);
+  if (a != b) dump_diff(a, b);
   CHECK(a == b);
   if (check::exact_backend()) compare(one, two);
   std::fprintf(stderr, "  %llu frames, %llu KV bytes, %llu requests\n", (unsigned long long)ts.frames,
@@ -234,6 +255,7 @@ TEST(disaggregated_over_shm_with_chunked_prefill_equals_colocated) {
   // 10 tokens per prefill step: prompts span several steps, so a block is sent once per
   // chunk that touches it, and the last version must win.
   auto b = disaggregated(w, rs, shm_pair(1 << 20), two, 10, 64);
+  if (a != b) dump_diff(a, b);
   CHECK(a == b);
   if (check::exact_backend()) compare(one, two);
 }
@@ -249,6 +271,7 @@ TEST(memory_pressure_on_the_decode_side_changes_nothing) {
   // some transfers find no room (the prompt is recomputed instead) and the decode
   // engine preempts.
   auto b = disaggregated(w, rs, tcp_pair(), two, 512, 12, nullptr, &ds, &rs_stats);
+  if (a != b) dump_diff(a, b);
   CHECK(a == b);
   if (check::exact_backend()) compare(one, two);
   std::fprintf(stderr, "  decode side: %llu transfers fell back to recompute, %llu preemptions\n",
@@ -300,6 +323,7 @@ TEST(prefill_prefix_cache_sends_cached_blocks_and_changes_nothing) {
     tx->close();
     receiver.join();
   }
+  if (a != b) dump_diff(a, b);
   CHECK(a == b);
   if (check::exact_backend()) compare(one, two);
   CHECK(ps.prefix_hit_tokens >= 5u * 32u);

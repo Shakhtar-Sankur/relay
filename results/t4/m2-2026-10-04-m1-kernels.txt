@@ -1,0 +1,72 @@
+# scripts/colab_m2.sh on Colab, Tesla T4 (driver 580.82.07, 15360 MiB, 2 CPU cores), relay commit 667e045
+# (M1 attention kernels): the KV transfer re-measured now that prefill is about 9x shorter.
+# test_transfer on the CPU backend failed once here: the test collected tokens from two threads
+# in arrival order, and on 2 busy cores a request's second token (decode worker) arrived before
+# its first (prefill worker). Same tokens, swapped. The test now places tokens by index.
+Tesla T4, 580.82.07, 15360 MiB
+relay commit: 667e045 M1: T4 results, README section and walkthrough
+2
+== build (CPU + CUDA backends)
+downloaded TinyLlama-1.1B
+== tests on the cpu backend
+test_safetensors: ok  (4 tests, 0 failed)
+test_sampler: ok  (4 tests, 0 failed)
+test_kv_cache: ok  (5 tests, 0 failed)
+test_reference: ok  (2 tests, 0 failed)
+test_batching: ok  (9 tests, 0 failed)
+test_transfer: FAILED  (10 tests, 1 failed)
+      FAILED /content/relay/tests/test_transfer.cpp:222: CHECK(a == b)
+      41 frames, 89088 KV bytes, 8 requests
+      decode side: 3 transfers fell back to recompute, 0 preemptions
+== tests on the cuda backend
+test_safetensors: ok  (4 tests, 0 failed)
+test_sampler: ok  (4 tests, 0 failed)
+test_kv_cache: ok  (5 tests, 0 failed)
+test_reference: ok  (2 tests, 0 failed)
+test_batching: ok  (9 tests, 0 failed)
+test_transfer: ok  (10 tests, 0 failed)
+      41 frames, 44544 KV bytes, 8 requests
+      decode side: 3 transfers fell back to recompute, 0 preemptions
+== raw transport speed
+transport tcp, sender and receiver in separate processes
+   message   messages       GB/s
+        4K     262144       0.67
+       64K      16384       4.33
+     1024K       1024       4.63
+    16384K         64       3.84
+transport shm, sender and receiver in separate processes
+   message   messages       GB/s
+        4K     262144       3.85
+       64K      16384       4.83
+     1024K       1024       4.46
+    16384K         64       2.86
+== layer streaming vs sending after the forward pass (CUDA backend)
+model models/tinyllama-1.1b, cuda backend, tcp transport, 512-token prompt, 22 layers, 11.53 MB of KV cache
+                          forward      ready    exposed
+send after forward        61.59ms    68.73ms     7.15ms
+stream layer by layer     59.88ms    59.93ms     0.05ms
+transfer: 11.53 MB; after-forward exposed time is 1.61 GB/s effective
+hidden by streaming: 99% of the exposed transfer time
+
+model models/tinyllama-1.1b, cuda backend, shm transport, 512-token prompt, 22 layers, 11.53 MB of KV cache
+                          forward      ready    exposed
+send after forward        61.78ms    75.49ms    13.70ms
+stream layer by layer     58.79ms    58.93ms     0.13ms
+transfer: 11.53 MB; after-forward exposed time is 0.84 GB/s effective
+hidden by streaming: 99% of the exposed transfer time
+
+model models/tinyllama-1.1b, cuda backend, tcp transport, 2048-token prompt, 22 layers, 46.14 MB of KV cache
+                          forward      ready    exposed
+send after forward       387.83ms   417.16ms    29.33ms
+stream layer by layer    383.41ms   383.41ms     0.00ms
+transfer: 46.14 MB; after-forward exposed time is 1.57 GB/s effective
+hidden by streaming: 100% of the exposed transfer time
+
+model models/tinyllama-1.1b, cuda backend, shm transport, 2048-token prompt, 22 layers, 46.14 MB of KV cache
+                          forward      ready    exposed
+send after forward       389.59ms   443.88ms    54.29ms
+stream layer by layer    386.14ms   386.17ms     0.04ms
+transfer: 46.14 MB; after-forward exposed time is 0.85 GB/s effective
+hidden by streaming: 100% of the exposed transfer time
+
+== done: copy everything from the first line and send it back
