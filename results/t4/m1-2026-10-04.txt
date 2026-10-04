@@ -1,0 +1,77 @@
+# scripts/colab_m1.sh on Colab, Tesla T4 (driver 580.82.07, 15360 MiB), relay commit 878cc4f
+# (an earlier run on f013e4d gave the same timings within a few percent; its test_attention
+# failed on a bug in the test's own schedule, fixed in 878cc4f, which also rewrote the int8 GEMV)
+Tesla T4, 580.82.07, 15360 MiB
+relay m1-kernels: 878cc4f M1: fix the attention comparison harness; int8 GEMV stages activations in shared memory
+== build (CPU + CUDA backends)
+built: relay-attention-bench relay-generate relay-transfer-bench relay-worker test_attention test_batching test_faults test_kv_cache test_reference test_safetensors test_sampler test_transfer test_worker 
+== real models and their Hugging Face reference outputs
+downloaded HuggingFaceTB/SmolLM2-135M
+downloaded TinyLlama/TinyLlama-1.1B-Chat-v1.0
+wrote models/smollm2-135m/relay-reference.json prompt tokens: 9 continuation: ':\n\n•\xa0\xa0\xa0\xa0\xa0\xa0\xa0\xa0'
+wrote models/tinyllama-1.1b/relay-reference.json prompt tokens: 10 continuation: ':\n\n1. Consistency: The system must'
+== 1. M1 attention against M0 attention, and int8 against fp16 (same GPU, same inputs)
+[  OK  ] the_comparison_schedule_runs_and_agrees_with_itself
+  /content/relay/tests/fixtures/llama-mha                      D=16 G=1: worst relative logit difference 3.82e-04, argmax agrees 94/94
+  /content/relay/tests/fixtures/chat-tiny                      D=16 G=2: worst relative logit difference 2.01e-04, argmax agrees 94/94
+  /content/relay/tests/fixtures/qwen2-bias                     D=16 G=2: worst relative logit difference 3.10e-04, argmax agrees 94/94
+  /content/relay/tests/fixtures/llama3-rope                    D=16 G=2: worst relative logit difference 3.16e-04, argmax agrees 94/94
+  /content/relay/models/smollm2-135m                           D=64 G=3: worst relative logit difference 4.80e-04, argmax agrees 43/43
+  /content/relay/models/tinyllama-1.1b                         D=64 G=8: worst relative logit difference 8.92e-04, argmax agrees 43/43
+[  OK  ] m1_attention_equals_m0_attention
+  /content/relay/tests/fixtures/llama-mha                      int8 vs fp16: relative logit difference 1.65e-02, argmax agrees 38/40
+  /content/relay/tests/fixtures/chat-tiny                      int8 vs fp16: relative logit difference 5.82e-03, argmax agrees 40/40
+  /content/relay/tests/fixtures/qwen2-bias                     int8 vs fp16: relative logit difference 8.82e-03, argmax agrees 40/40
+  /content/relay/tests/fixtures/llama3-rope                    int8 vs fp16: relative logit difference 1.08e-02, argmax agrees 40/40
+  /content/relay/models/smollm2-135m                           int8 vs fp16: relative logit difference 2.76e-02, argmax agrees 25/28
+  /content/relay/models/tinyllama-1.1b                         int8 vs fp16: relative logit difference 2.61e-02, argmax agrees 25/28
+[  OK  ] int8_weights_stay_close_to_fp16
+3 tests, 0 failed
+== 2. every model test on the CUDA backend with the M1 kernels (logits against Hugging Face)
+test_safetensors: ok  (4 tests, 0 failed)
+test_sampler: ok  (4 tests, 0 failed)
+test_kv_cache: ok  (5 tests, 0 failed)
+test_reference: ok  (2 tests, 0 failed)
+      chat-tiny (cuda): 38 prompt rows, largest relative error 7.40e-04
+      llama-gqa-tied-bf16 (cuda): 21 prompt rows, largest relative error 5.12e-04
+      llama-mha (cuda): 21 prompt rows, largest relative error 8.95e-04
+      llama3-rope (cuda): 21 prompt rows, largest relative error 8.43e-04
+      qwen2-bias (cuda): 21 prompt rows, largest relative error 6.12e-04
+      smollm2-135m (cuda): 1 prompt rows, largest relative error 7.61e-04
+      tinyllama-1.1b (cuda): 1 prompt rows, largest relative error 4.62e-04
+      chat-tiny (cuda): 8 generated tokens identical, largest relative error 5.93e-04
+      llama-gqa-tied-bf16 (cuda): 8 generated tokens identical, largest relative error 3.46e-04
+      llama-mha (cuda): 8 generated tokens identical, largest relative error 1.08e-03
+      llama3-rope (cuda): 8 generated tokens identical, largest relative error 8.16e-04
+      qwen2-bias (cuda): 8 generated tokens identical, largest relative error 5.38e-04
+test_batching: ok  (9 tests, 0 failed)
+test_transfer: ok  (10 tests, 0 failed)
+== 3. forward-pass time: M0 kernel vs M1 kernels vs M1 + int8
+model models/tinyllama-1.1b, CUDA backend, median of 5 runs
+                                M0 kernel   M1 kernels    M1 + int8   M1 vs M0
+prefill  512 tokens (ms)           258.3         64.1         83.8      4.03x
+prefill 2048 tokens (ms)          3733.9        430.7        508.2      8.67x
+decode b=1  ctx=512  (ms/step)      12.47        11.13         8.33      1.12x   (90 tok/s with M1, 120 with int8)
+decode b=8  ctx=512  (ms/step)      19.95        12.73        16.99      1.57x   (628 tok/s with M1, 471 with int8)
+decode b=32 ctx=512  (ms/step)      47.55        19.17        39.26      2.48x   (1669 tok/s with M1, 815 with int8)
+decode b=1  ctx=2048 (ms/step)      20.13        11.34         7.21      1.78x   (88 tok/s with M1, 139 with int8)
+decode b=8  ctx=2048 (ms/step)      48.17        16.08        21.42      3.00x   (498 tok/s with M1, 373 with int8)
+decode b=32 ctx=2048 (ms/step)     176.75        32.97        59.60      5.36x   (971 tok/s with M1, 537 with int8)
+model models/smollm2-135m, CUDA backend, median of 5 runs
+                                M0 kernel   M1 kernels    M1 + int8   M1 vs M0
+prefill  512 tokens (ms)           104.3         20.5         23.0      5.10x
+prefill 2048 tokens (ms)          1549.4        149.1        158.1     10.39x
+decode b=1  ctx=512  (ms/step)       5.31         3.49         2.96      1.52x   (287 tok/s with M1, 337 with int8)
+decode b=8  ctx=512  (ms/step)       7.76         4.40         5.04      1.76x   (1817 tok/s with M1, 1588 with int8)
+decode b=32 ctx=512  (ms/step)      18.80         6.57         8.80      2.86x   (4871 tok/s with M1, 3637 with int8)
+decode b=1  ctx=2048 (ms/step)      14.17         3.49         3.03      4.06x   (287 tok/s with M1, 330 with int8)
+decode b=8  ctx=2048 (ms/step)      23.09         5.71         6.75      4.05x   (1402 tok/s with M1, 1186 with int8)
+decode b=32 ctx=2048 (ms/step)      66.57        14.05        16.10      4.74x   (2278 tok/s with M1, 1988 with int8)
+== 4. end-to-end generation speed (TinyLlama-1.1B, 128 new tokens per request; M0 was 92 / 535 / 1217 tok/s)
+  M1 batch 1: cuda backend: loaded in 10.42 s; 128 tokens generated in 1.51 s (85.0 tok/s), 128 steps, 0 preemptions
+  M1+int8 batch 1: cuda backend: loaded in 9.39 s; 128 tokens generated in 0.97 s (131.6 tok/s), 128 steps, 0 preemptions
+  M1 batch 8: cuda backend: loaded in 9.56 s; 1024 tokens generated in 1.63 s (628.0 tok/s), 128 steps, 0 preemptions
+  M1+int8 batch 8: cuda backend: loaded in 9.74 s; 1024 tokens generated in 2.38 s (431.1 tok/s), 128 steps, 0 preemptions
+  M1 batch 32: cuda backend: loaded in 9.62 s; 4096 tokens generated in 2.29 s (1785.1 tok/s), 128 steps, 0 preemptions
+  M1+int8 batch 32: cuda backend: loaded in 9.58 s; 4096 tokens generated in 5.13 s (799.1 tok/s), 128 steps, 0 preemptions
+== done: copy everything from the first line and send it back

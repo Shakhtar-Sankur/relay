@@ -19,6 +19,7 @@ CUDA, written from scratch.
 
 Why and how: [`docs/design.md`](docs/design.md). Code walkthrough with interview
 questions: [`docs/m0-walkthrough.md`](docs/m0-walkthrough.md) (engine),
+[`docs/m1-walkthrough.md`](docs/m1-walkthrough.md) (CUDA kernels),
 [`docs/m2-walkthrough.md`](docs/m2-walkthrough.md) (KV transfer),
 [`docs/m3-walkthrough.md`](docs/m3-walkthrough.md) (Swift control plane),
 [`docs/m4-walkthrough.md`](docs/m4-walkthrough.md) (cluster),
@@ -29,7 +30,7 @@ questions: [`docs/m0-walkthrough.md`](docs/m0-walkthrough.md) (engine),
 | | Milestone | State |
 |---|---|---|
 | M0 | Engine core: Llama-architecture models (Llama 2/3.x, TinyLlama, SmolLM2, Qwen2), float32 CPU reference backend, CUDA backend (fp16, cuBLAS), paged KV cache, continuous batching with chunked prefill and preemption | done |
-| M1 | CUDA kernels: paged decode attention, flash-style prefill, fused RMSNorm/RoPE, int8 weights | |
+| M1 | CUDA kernels: flash-style prefill attention on tensor cores, split-context (flash-decoding) attention over the paged cache, weight-only int8 | done |
 | M2 | KV transfer engine: layer-by-layer streaming during the forward pass, zero-copy TCP and shared-memory transports, recompute fallback under memory pressure | done |
 | M3 | Swift control plane: Swift↔C++ interop, a tokenizer matching Hugging Face, chat templates, an OpenAI-compatible HTTP API with streaming | done (in-process engine; remote workers in M4) |
 | M4 | The cluster: `relay-worker` processes (prefill, decode, colocated) behind the Swift control plane; prefix caching; prefix-aware routing (rendezvous hashing with a load guard), memory-aware decode placement, admission control | done |
@@ -52,12 +53,57 @@ KV cache, fp32 accumulation, on a Tesla T4 (raw output:
 
 M0 generation speed on the T4, TinyLlama-1.1B, 128 new tokens per request: 92 tok/s for
 one request, 535 tok/s for 8, 1,217 tok/s for 32 (continuous batching; cuBLAS GEMMs and a
-simple attention kernel that M1 replaces). These are starting points, not comparisons.
+simple attention kernel that M1 replaces). M1's numbers are below.
 
 The batching tests pass on both backends; bit for bit on the CPU backend: a request gives the same logits run alone or in a
 batch of eight, with its prompt in 7-token chunks, after being preempted and recomputed,
 with any block size, and when its KV blocks are copied to a second backend that continues
 decoding (disaggregation in miniature).
+
+## CUDA kernels (M1)
+
+M0's attention kernel ran one block per query token and head, with the whole score row in
+shared memory. M1 replaces it with two kernels that read the paged KV cache directly
+(`engine/src/cuda_kernels.cuh`):
+
+- **Prefill**: flash attention on tensor cores. A block takes 64 query rows of one head,
+  walks the keys 32 at a time (WMMA 16x16x16, fp16 in, fp32 out), and keeps a running
+  softmax, so no context-by-context matrix exists and the context length no longer depends
+  on shared memory.
+- **Decode**: flash-decoding. A block takes one sequence, one KV head and a 512-key slice of
+  the context; all query heads sharing that KV head (grouped-query attention) are scored
+  together, so each K/V row is read once; a second kernel merges the slices (log-sum-exp).
+- **Weight-only int8** (optional, `RELAY_CUDA_INT8=1`): one scale per output row; decode
+  batches of up to 8 tokens use a matrix-vector kernel that streams the int8 weights,
+  larger batches dequantize and use cuBLAS.
+
+Checked on a T4 against M0's kernel on the same inputs (prompts split into chunks, contexts
+past one slice, decode and prefill in one batch, multi-head and grouped-query models): worst
+relative logit difference 2e-4 to 9e-4, every argmax the same. Every Hugging Face reference
+test passes with the M1 kernels, generated tokens identical. Raw output:
+[`results/t4/m1-2026-10-04.txt`](results/t4/m1-2026-10-04.txt).
+
+Forward-pass time on the T4, M0 kernel vs M1 kernels (everything else unchanged):
+
+| | TinyLlama-1.1B: M0 → M1 | SmolLM2-135M: M0 → M1 |
+|---|---|---|
+| Prefill, 2,048-token prompt | 3,734 → 431 ms (**8.7x**) | 1,549 → 149 ms (**10.4x**) |
+| Prefill, 512-token prompt | 258 → 64 ms (4.0x) | 104 → 20.5 ms (5.1x) |
+| Decode step, 32 sequences at 2,048 tokens | 176.8 → 33.0 ms (**5.4x**) | 66.6 → 14.1 ms (4.7x) |
+| Decode step, 8 sequences at 2,048 tokens | 48.2 → 16.1 ms (3.0x) | 23.1 → 5.7 ms (4.1x) |
+| Decode step, 1 sequence at 512 tokens | 12.5 → 11.1 ms (1.1x) | 5.3 → 3.5 ms (1.5x) |
+
+The gain grows with context and batch, where attention is the cost. One short sequence is
+bound by reading the weights, so attention changes little there: end-to-end TinyLlama
+generation (10-token prompt, 128 new tokens) goes from 535 to 628 tok/s for 8 requests and
+from 1,217 to 1,785 tok/s for 32 (1.47x), and stays at 85-93 tok/s for one.
+
+int8 (the transformer layers; embeddings and the output layer stay fp16) cuts TinyLlama's
+weights from 2.2 to 1.2 GB and helps exactly where reading them dominates: one TinyLlama
+sequence decodes in 7.2 ms instead of 11.3 (1.55x; 132 vs 85 tok/s end to end). From 8
+sequences on, fp16 on tensor cores wins (dequantizing for cuBLAS costs more than it saves),
+so int8 is a batch-1 latency and memory option, not a throughput one. Its logits stay within
+0.6-2.8% (relative) of fp16, with occasional argmax flips at near-ties.
 
 ## The KV transfer engine (M2)
 
@@ -174,7 +220,8 @@ RELAY_REFERENCE_MODELS=path/to/SmolLM2-135M ./build/test_reference
 ./build/relay-generate --model path/to/model --ids "504 1296 768" --max-new 32 [--backend cuda]
 ```
 
-On a GPU in Colab, `scripts/colab_m0.sh` does all of the above.
+On a GPU in Colab, `scripts/colab_m0.sh` does all of the above; `scripts/colab_m1.sh` checks
+and times the M1 kernels (`tools/relay_attention_bench.cpp`).
 
 ## Layout
 

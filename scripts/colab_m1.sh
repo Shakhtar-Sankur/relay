@@ -4,7 +4,7 @@
 # Colab: Runtime -> Change runtime type -> T4 GPU. Paste this file into ONE cell (about 15-20 minutes).
 set -e
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader || echo "NO GPU: turn on a T4 GPU"
-BRANCH=${RELAY_BRANCH:-m1-kernels}
+BRANCH=${RELAY_BRANCH:-main}
 cd /content && rm -rf relay && git clone -q -b $BRANCH https://github.com/Shakhtar-Sankur/relay && cd relay
 echo "relay $BRANCH: $(git log -1 --format='%h %s')"
 pip install -q transformers safetensors huggingface_hub 2>&1 | tail -1 || true
