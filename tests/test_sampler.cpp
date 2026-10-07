@@ -49,4 +49,16 @@ TEST(samples_follow_the_softmax) {
   CHECK(std::fabs(count[2] / double(n) - 0.2) < 0.02);
 }
 
+TEST(log_prob_is_the_tempered_log_softmax) {
+  std::vector<float> lg = {2.0f, -1.0f, 0.5f, 3.0f};
+  for (float t : {0.0f, 1.0f, 0.7f}) {
+    double tt = t > 0 ? t : 1.0, z = 0;
+    for (float x : lg) z += std::exp(x / tt);
+    for (int k = 0; k < 4; ++k) CHECK(std::fabs(log_prob(lg.data(), 4, t, k) - (lg[k] / tt - std::log(z))) < 1e-12);
+  }
+  // Large logits do not overflow.
+  std::vector<float> big = {1000.0f, 999.0f};
+  CHECK(std::fabs(log_prob(big.data(), 2, 1.0f, 0) - (-std::log(1 + std::exp(-1.0)))) < 1e-12);
+}
+
 RUN_TESTS()

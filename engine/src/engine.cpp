@@ -266,7 +266,9 @@ std::vector<TokenEvent> Engine::step_locked() {
     const auto& eos = backend_.config().eos_ids;
     if (!s->req.params.ignore_eos && std::find(eos.begin(), eos.end(), tok) != eos.end()) f = Finish::Stop;
     else if (s->generated >= s->req.params.max_new_tokens) f = Finish::Length;
-    events.push_back({s->req.id, tok, index, f});
+    TokenEvent ev{s->req.id, tok, index, f};
+    if (opt_.logprobs) ev.logprob = static_cast<float>(log_prob(lg, V, s->req.params.temperature, tok));
+    events.push_back(ev);
     if (f != Finish::None) s->done = true;
   }
 

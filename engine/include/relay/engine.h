@@ -37,6 +37,7 @@ struct EngineOptions {
   int max_batch_tokens = 512;  // tokens per forward pass (decode tokens + prefill chunks)
   int max_seqs = 64;           // requests running at once
   bool prefix_caching = true;  // reuse the KV blocks of prompt prefixes seen before
+  bool logprobs = false;       // report each sampled token's log-probability (RL rollouts)
 };
 
 struct Request {
@@ -52,6 +53,10 @@ struct TokenEvent {
   int token;
   int index;  // 0 for the first generated token
   Finish finish;
+  // With EngineOptions::logprobs: log p(token) under softmax(logits / temperature)
+  // (temperature 1 when greedy), over the whole vocabulary: top-k and top-p are not
+  // applied, so it is the policy an RL trainer computes. 0 otherwise.
+  float logprob = 0;
 };
 
 struct EngineStats {

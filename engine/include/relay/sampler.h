@@ -26,5 +26,7 @@ double uniform01(std::uint64_t seed, std::uint64_t index);
 
 int sample(const float* logits, int vocab, const SamplingParams& p, std::uint64_t index);
 int argmax(const float* logits, int vocab);
+// log softmax(logits / temperature)[token], in double precision (temperature <= 0: 1).
+double log_prob(const float* logits, int vocab, float temperature, int token);
 
 }  // namespace relay

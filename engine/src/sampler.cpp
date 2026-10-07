@@ -21,6 +21,15 @@ int argmax(const float* logits, int vocab) {
   return best;
 }
 
+double log_prob(const float* logits, int vocab, float temperature, int token) {
+  const double t = temperature > 0.0f ? temperature : 1.0;
+  double mx = logits[0];
+  for (int i = 1; i < vocab; ++i) mx = std::max(mx, static_cast<double>(logits[i]));
+  double sum = 0;
+  for (int i = 0; i < vocab; ++i) sum += std::exp((logits[i] - mx) / t);
+  return (logits[token] - mx) / t - std::log(sum);
+}
+
 int sample(const float* logits, int vocab, const SamplingParams& p, std::uint64_t index) {
   if (p.temperature <= 0.0f) return argmax(logits, vocab);
 

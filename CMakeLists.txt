@@ -26,8 +26,11 @@ add_library(relay_engine
   engine/src/transport.cpp
   engine/src/kv_transfer.cpp
   engine/src/worker.cpp
+  engine/src/c_api.cpp
 )
 target_include_directories(relay_engine PUBLIC engine/include)
+# Position-independent, so the C interface can be a shared library (librelay_c) for Python.
+set_target_properties(relay_engine PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(relay_engine PUBLIC OpenMP::OpenMP_CXX Threads::Threads)
 target_compile_options(relay_engine PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers>)
 if(RELAY_NATIVE)
@@ -45,6 +48,10 @@ if(RELAY_CUDA)
   target_link_libraries(relay_engine PUBLIC CUDA::cudart CUDA::cublas)
 endif()
 
+# The C interface (relay/c_api.h) as a shared library, loaded by Python through ctypes.
+add_library(relay_c SHARED engine/src/c_api.cpp)
+target_link_libraries(relay_c PRIVATE relay_engine)
+
 add_executable(relay-generate tools/relay_generate.cpp)
 target_link_libraries(relay-generate PRIVATE relay_engine)
 add_executable(relay-worker tools/relay_worker.cpp)
@@ -55,7 +62,7 @@ add_executable(relay-attention-bench tools/relay_attention_bench.cpp)
 target_link_libraries(relay-attention-bench PRIVATE relay_engine)
 
 enable_testing()
-foreach(t safetensors kv_cache reference batching sampler transfer worker faults attention)
+foreach(t safetensors kv_cache reference batching sampler transfer worker faults attention c_api)
   add_executable(test_${t} tests/test_${t}.cpp)
   target_link_libraries(test_${t} PRIVATE relay_engine)
   target_compile_definitions(test_${t} PRIVATE RELAY_FIXTURES="${CMAKE_SOURCE_DIR}/tests/fixtures")
