@@ -65,6 +65,12 @@ std::uint64_t BlockManager::block_hash(std::uint64_t parent, const int* tokens) 
   return h == 0 ? 1 : h;
 }
 
+void BlockManager::drop_cache() {
+  while (!lru_.empty()) evict_one();
+  for (auto& [h, b] : index_) hash_of_[b] = 0;  // still referenced by running requests
+  index_.clear();
+}
+
 void BlockManager::evict_one() {
   int b = lru_.front();
   lru_.pop_front();

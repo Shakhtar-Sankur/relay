@@ -1,8 +1,13 @@
 #include "relay/backend.h"
 
 #include <cstring>
+#include <stdexcept>
 
 namespace relay {
+
+void Backend::update_weight(const std::string& name, const float* src, std::size_t n) {
+  throw std::logic_error(this->name() + " backend: update_weight is not supported; write the host weights");
+}
 
 void Backend::read_kv_layer(int layer, const std::vector<int>& blocks, void* out) {
   const std::size_t bb = kv_block_bytes(), n = blocks.size();

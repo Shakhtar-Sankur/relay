@@ -82,6 +82,9 @@ class BlockManager {
   // Blocks that can be allocated now: free, or cached and unused (evictable).
   int num_available() const { return static_cast<int>(free_.size() + lru_.size()); }
   int num_cached() const { return static_cast<int>(index_.size()); }
+  // Forgets every cached prefix (after a weight update its KV entries are stale). The
+  // blocks of running requests stay theirs; only unused cached blocks are freed.
+  void drop_cache();
 
   // n blocks, all or nothing. Takes free blocks first, then evicts the least recently used.
   bool allocate(int n, std::vector<int>& out);

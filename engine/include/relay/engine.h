@@ -105,6 +105,9 @@ class Engine {
   bool cancel(std::uint64_t id);
   // Drops every request and frees its blocks (a new control plane took over).
   void cancel_all();
+  // Forgets the prefix cache: after the backend's weights change, cached KV entries
+  // were computed with the old ones. Only with no requests in flight.
+  void drop_prefix_cache();
 
   EngineStats stats() const;
   int free_blocks() const;

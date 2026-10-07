@@ -23,6 +23,7 @@ struct relay_engine {
   EngineOptions opt;
   std::unique_ptr<Backend> backend;
   std::unique_ptr<Engine> engine;
+  bool host_stale = false;  // the backend's weights were updated past the model's host copy
 };
 
 namespace {
@@ -225,8 +226,31 @@ void relay_engine_cancel_all(relay_engine* e) { e->engine->cancel_all(); }
 int relay_engine_reload_weights(relay_engine* e) {
   return guarded([&] {
     if (e->engine->has_work()) throw std::logic_error("requests in flight: reload weights between rollouts");
+    if (e->host_stale)
+      throw std::logic_error("the backend's weights are newer than the host copy (relay_engine_update_tensor): "
+                             "a reload would bring the old weights back");
     build(e);
   });
+}
+
+int relay_engine_update_tensor(relay_engine* e, const char* name, const float* src, int64_t numel) {
+  return guarded([&] {
+    if (e->engine->has_work()) throw std::logic_error("requests in flight: update weights between rollouts");
+    if (!src || numel < 0) throw std::invalid_argument("bad source");
+    if (e->backend_name == "cpu") {
+      std::vector<float>* t = find_tensor(e->model->w, name);
+      if (!t) throw std::invalid_argument(std::string("no tensor '") + name + "'");
+      if (static_cast<int64_t>(t->size()) != numel) throw std::invalid_argument(std::string(name) + ": wrong size");
+      std::memcpy(t->data(), src, static_cast<std::size_t>(numel) * sizeof(float));
+    } else {
+      e->backend->update_weight(name, src, static_cast<std::size_t>(numel));
+      e->host_stale = true;
+    }
+  });
+}
+
+int relay_engine_finish_update(relay_engine* e) {
+  return guarded([&] { e->engine->drop_prefix_cache(); });
 }
 
 int relay_engine_stats(relay_engine* e, relay_stats* out) {

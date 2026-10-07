@@ -70,6 +70,14 @@ class Backend {
   // Blocks until the K/V writes of `layer` from the latest forward() are complete.
   // A no-op where kv_written() is only called after the writes are done (CPU).
   virtual void wait_kv_written(int layer) {}
+
+  // Overwrites one weight, by relay's name ("embed", "final_norm", "lm_head",
+  // "layers.<i>.<attn_norm|wqkv|bqkv|wo|mlp_norm|w_gate_up|w_down>"), with n float32
+  // values in relay's layout. On the CUDA backend `src` may be host memory or device
+  // memory on any GPU, and is converted to the backend's own format on the device; the
+  // copy is complete when the call returns. Only between forward passes. Backends that
+  // read the host weights in place (CPU) do not implement it: write those instead.
+  virtual void update_weight(const std::string& name, const float* src, std::size_t n);
 };
 
 std::unique_ptr<Backend> make_cpu_backend(const HostWeights& weights, int num_blocks, int block_size);

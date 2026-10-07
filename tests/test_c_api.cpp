@@ -173,4 +173,40 @@ TEST(resume_continues_exactly) {
   relay_model_free(m);
 }
 
+TEST(update_tensor_equals_a_host_write_and_drops_the_prefix_cache) {
+  relay_model* a = relay_model_load(kModel);
+  relay_model* b = relay_model_load(kModel);
+  relay_engine* ea = relay_engine_new(a, "cpu", 0, 64, 8, 64, 8, 1);
+  relay_engine* eb = relay_engine_new(b, "cpu", 0, 64, 8, 64, 8, 1);
+  run_c(ea, 3);  // fills the prefix cache
+  relay_stats st;
+  // New weights for every tensor of layer 1 and the final norm: a host write + reload
+  // on one engine, update_tensor + finish_update on the other.
+  for (const char* name : {"layers.1.wqkv", "layers.1.wo", "layers.1.w_gate_up", "layers.1.w_down",
+                           "layers.1.attn_norm", "layers.1.mlp_norm", "final_norm"}) {
+    int64_t n = 0;
+    float* w = relay_model_tensor(b, name, &n);
+    std::vector<float> nw(w, w + n);
+    for (int64_t i = 0; i < n; ++i) nw[i] = nw[i] * 1.5f + 0.01f * static_cast<float>(i % 7);
+    std::memcpy(w, nw.data(), n * sizeof(float));
+    CHECK_EQ(relay_engine_update_tensor(ea, name, nw.data(), n), 0);
+  }
+  CHECK_EQ(relay_engine_finish_update(ea), 0);
+  CHECK_EQ(relay_engine_reload_weights(eb), 0);
+  CHECK_EQ(relay_engine_stats(ea, &st), 0);
+  uint64_t hits_before = st.prefix_hit_tokens;
+  Out x = run_c(ea, 3), y = run_c(eb, 3);
+  CHECK(x.tokens == y.tokens);
+  CHECK(x.logprobs == y.logprobs);
+  CHECK_EQ(relay_engine_stats(ea, &st), 0);
+  CHECK_EQ(st.prefix_hit_tokens, hits_before);  // nothing served from the old cache
+  float dummy[1] = {0};
+  CHECK_EQ(relay_engine_update_tensor(ea, "final_norm", dummy, 1), -1);  // wrong size
+  CHECK_EQ(relay_engine_update_tensor(ea, "layers.9.wo", dummy, 1), -1);
+  relay_engine_free(ea);
+  relay_engine_free(eb);
+  relay_model_free(a);
+  relay_model_free(b);
+}
+
 RUN_TESTS()

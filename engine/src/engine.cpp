@@ -72,6 +72,12 @@ void Engine::add_resume(Request request, const std::vector<int>& generated) {
   waiting_.push_back(std::move(s));
 }
 
+void Engine::drop_prefix_cache() {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (has_work_locked()) throw std::logic_error("drop_prefix_cache: requests in flight");
+  alloc_.drop_cache();
+}
+
 bool Engine::cancel(std::uint64_t id) {
   std::lock_guard<std::mutex> lock(mu_);
   for (auto it = waiting_.begin(); it != waiting_.end(); ++it)

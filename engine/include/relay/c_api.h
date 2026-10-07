@@ -92,6 +92,17 @@ void relay_engine_cancel_all(relay_engine* e);
  * backend uploads them again) and drops the prefix cache. Only between rollouts: fails
  * while requests are in flight. */
 int relay_engine_reload_weights(relay_engine* e);
+/* The fast weight sync: overwrites one weight of the engine's backend from numel
+ * float32 values in relay's layout. On the CUDA backend `src` may be a device pointer
+ * on any GPU (a trainer's parameter: converted to fp16 on the device, no host round
+ * trip, no rebuild) or host memory; the model's host copy is then NOT updated, and
+ * relay_engine_reload_weights() is refused from then on, since it would bring the old
+ * weights back. On the CPU backend `src` is host memory, copied into the model's
+ * weights, which that backend reads in place. Only between rollouts. Call
+ * relay_engine_finish_update() after the last tensor. */
+int relay_engine_update_tensor(relay_engine* e, const char* name, const float* src, int64_t numel);
+/* Ends a weight update: drops the prefix cache, whose KV entries used the old weights. */
+int relay_engine_finish_update(relay_engine* e);
 int relay_engine_stats(relay_engine* e, relay_stats* out);
 
 #ifdef __cplusplus

@@ -107,6 +107,14 @@ DeviceArray<float> to_device_f32(const std::vector<float>& v) {
 
 // ---- kernels ---------------------------------------------------------------
 
+// fp32 -> fp16, round to nearest even: the same bits as the host's f32_to_f16, so a
+// weight updated on the device equals one uploaded from the host.
+__global__ void f32_to_f16_kernel(const float* in, __half* out, std::size_t n) {
+  for (std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x; i < n;
+       i += static_cast<std::size_t>(gridDim.x) * blockDim.x)
+    out[i] = __float2half_rn(in[i]);
+}
+
 __device__ float block_sum(float v, float* scratch) {
   for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffff, v, o);
   int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -306,6 +314,7 @@ class CudaBackend final : public Backend {
               CudaOptions options)
       : c_(w.config), opt_(options), max_tokens_(max_tokens), max_context_(max_context) {
     CUDA_CHECK(cudaSetDevice(device));
+    device_ = device;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
     CUDA_CHECK(cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking));
     CUBLAS_CHECK(cublasCreate(&cublas_));
@@ -381,6 +390,29 @@ class CudaBackend final : public Backend {
     if (opt_.int8_weights) dequant_ = DeviceArray<__half>(dequant_elems_);
   }
 
+  // Feeds `src` (host memory, or device memory on any GPU) to `apply` as float32 chunks
+  // on this device: in place when it already lives here, else through a staging buffer
+  // of at most kStageFloats (a peer copy between GPUs, or an upload from the host).
+  template <class F>
+  void copy_converted(const float* src, std::size_t n, F&& apply) {
+    cudaPointerAttributes a{};
+    CUDA_CHECK(cudaPointerGetAttributes(&a, src));
+    if (a.type == cudaMemoryTypeDevice && a.device == device_) {
+      apply(src, 0, n);
+      return;
+    }
+    constexpr std::size_t kStageFloats = std::size_t(16) << 20;  // 64 MB
+    if (stage_.n < std::min(n, kStageFloats)) stage_ = DeviceArray<float>(std::min(n, kStageFloats));
+    for (std::size_t off = 0; off < n; off += kStageFloats) {
+      std::size_t len = std::min(kStageFloats, n - off);
+      if (a.type == cudaMemoryTypeDevice)
+        CUDA_CHECK(cudaMemcpyPeerAsync(stage_.p, device_, src + off, a.device, len * 4, stream_));
+      else
+        CUDA_CHECK(cudaMemcpyAsync(stage_.p, src + off, len * 4, cudaMemcpyHostToDevice, stream_));
+      apply(stage_.p, off, len);
+    }
+  }
+
   ~CudaBackend() override {
     if (pinned_) cudaFreeHost(pinned_);
     if (cublas_) cublasDestroy(cublas_);
@@ -392,6 +424,56 @@ class CudaBackend final : public Backend {
   const ModelConfig& config() const override { return c_; }
   const KVLayout& kv_layout() const override { return layout_; }
   std::string name() const override { return "cuda"; }
+
+  void update_weight(const std::string& name, const float* src, std::size_t n) override {
+    CUDA_CHECK(cudaSetDevice(device_));
+    auto check = [&](std::size_t want) {
+      if (n != want) throw std::invalid_argument("update_weight " + name + ": wrong size");
+    };
+    auto to_f16 = [&](DeviceArray<__half>& dst) {
+      check(dst.n);
+      copy_converted(src, n, [&](const float* chunk, std::size_t off, std::size_t len) {
+        f32_to_f16_kernel<<<static_cast<unsigned>(std::min<std::size_t>((len + 255) / 256, 4096)), 256, 0, stream_>>>(
+            chunk, dst.p + off, len);
+      });
+    };
+    auto to_f32 = [&](DeviceArray<float>& dst) {
+      check(dst.n);
+      copy_converted(src, n, [&](const float* chunk, std::size_t off, std::size_t len) {
+        CUDA_CHECK(cudaMemcpyAsync(dst.p + off, chunk, len * 4, cudaMemcpyDeviceToDevice, stream_));
+      });
+    };
+    auto matrix = [&](DeviceMatrix& m) {
+      if (m.i8.p) throw std::logic_error("update_weight: int8 weights must be requantized; rebuild the backend");
+      to_f16(m.f16);
+    };
+    if (name == "embed") {
+      to_f16(embed_);
+    } else if (name == "lm_head") {
+      if (!lm_head_.n) throw std::invalid_argument("update_weight: tied embeddings have no lm_head");
+      to_f16(lm_head_);
+    } else if (name == "final_norm") {
+      to_f32(final_norm_);
+    } else if (name.rfind("layers.", 0) == 0) {
+      std::size_t dot = name.find('.', 7);
+      int i = dot == std::string::npos ? -1 : std::stoi(name.substr(7, dot - 7));
+      if (i < 0 || i >= static_cast<int>(layers_.size())) throw std::invalid_argument("update_weight: no " + name);
+      DeviceLayer& L = layers_[i];
+      std::string f = name.substr(dot + 1);
+      if (f == "attn_norm") to_f32(L.attn_norm);
+      else if (f == "mlp_norm") to_f32(L.mlp_norm);
+      else if (f == "bqkv" && L.bqkv.n) to_f32(L.bqkv);
+      else if (f == "wqkv") matrix(L.wqkv);
+      else if (f == "wo") matrix(L.wo);
+      else if (f == "w_gate_up") matrix(L.w_gate_up);
+      else if (f == "w_down") matrix(L.w_down);
+      else throw std::invalid_argument("update_weight: no " + name);
+    } else {
+      throw std::invalid_argument("update_weight: no " + name);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaStreamSynchronize(stream_));
+  }
   std::size_t kv_block_bytes() const override { return static_cast<std::size_t>(layout_.block_elems()) * 2; }
 
   void read_kv_block(int layer, int block, void* k_out, void* v_out) override {
@@ -649,6 +731,8 @@ class CudaBackend final : public Backend {
   int max_tokens_, max_context_;
   cublasHandle_t cublas_ = nullptr;
   cudaStream_t stream_ = nullptr, copy_stream_ = nullptr;
+  int device_ = 0;
+  DeviceArray<float> stage_;  // update_weight's staging buffer
   std::vector<cudaEvent_t> layer_done_;
   std::mutex copy_mu_;
   DeviceArray<uint4> staging_dev_;
