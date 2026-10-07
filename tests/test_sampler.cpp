@@ -61,4 +61,22 @@ TEST(log_prob_is_the_tempered_log_softmax) {
   CHECK(std::fabs(log_prob(big.data(), 2, 1.0f, 0) - (-std::log(1 + std::exp(-1.0)))) < 1e-12);
 }
 
+TEST(sample_with_log_prob_agrees_with_sample_and_log_prob) {
+  std::vector<float> lg(1000);
+  for (int i = 0; i < 1000; ++i) lg[i] = std::sin(i * 0.37f) * 6;
+  for (float t : {0.0f, 1.0f, 0.6f})
+    for (float top_p : {1.0f, 0.9f}) {
+      SamplingParams p;
+      p.temperature = t;
+      p.top_p = top_p;
+      p.seed = 5;
+      for (std::uint64_t i = 0; i < 200; ++i) {
+        double lp = 0;
+        int tok = sample_with_log_prob(lg.data(), 1000, p, i, &lp);
+        CHECK_EQ(tok, sample(lg.data(), 1000, p, i));
+        CHECK(std::fabs(lp - log_prob(lg.data(), 1000, t, tok)) < 1e-5);
+      }
+    }
+}
+
 RUN_TESTS()

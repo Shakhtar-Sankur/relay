@@ -30,8 +30,45 @@ double log_prob(const float* logits, int vocab, float temperature, int token) {
   return (logits[token] - mx) / t - std::log(sum);
 }
 
+int sample_with_log_prob(const float* logits, int vocab, const SamplingParams& p, std::uint64_t index,
+                         double* log_prob_out) {
+  if (p.temperature > 0.0f && (p.top_k <= 0 || p.top_k >= vocab) && p.top_p >= 1.0f) {
+    const float inv_t = 1.0f / p.temperature;
+    float mx = logits[0];
+    for (int i = 1; i < vocab; ++i) mx = std::max(mx, logits[i]);
+    thread_local std::vector<float> e;
+    e.resize(vocab);
+    double total = 0;
+    for (int i = 0; i < vocab; ++i) total += e[i] = std::exp((logits[i] - mx) * inv_t);
+    double r = uniform01(p.seed, index) * total;
+    int tok = vocab - 1;
+    for (int i = 0; i < vocab; ++i) {
+      r -= e[i];
+      if (r < 0) {
+        tok = i;
+        break;
+      }
+    }
+    if (r >= 0)  // rounding: the last token with any mass
+      while (tok > 0 && e[tok] == 0.0f) --tok;
+    *log_prob_out = (static_cast<double>(logits[tok]) - mx) * inv_t - std::log(total);
+    return tok;
+  }
+  int tok = sample(logits, vocab, p, index);
+  *log_prob_out = log_prob(logits, vocab, p.temperature, tok);
+  return tok;
+}
+
 int sample(const float* logits, int vocab, const SamplingParams& p, std::uint64_t index) {
   if (p.temperature <= 0.0f) return argmax(logits, vocab);
+
+  // No truncation (no top-k, no top-p, as RL sampling uses): the inverse CDF in id order,
+  // with no sort (sorting a 150k-entry vocabulary for every token cost more than the GPU's
+  // forward pass). Shared with sample_with_log_prob, so both pick the same token.
+  if ((p.top_k <= 0 || p.top_k >= vocab) && p.top_p >= 1.0f) {
+    double lp;
+    return sample_with_log_prob(logits, vocab, p, index, &lp);
+  }
 
   // Candidates sorted by logit (ties by id, so the order is fully determined).
   std::vector<int> ids(vocab);

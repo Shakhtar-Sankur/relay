@@ -256,16 +256,37 @@ std::vector<TokenEvent> Engine::step_locked() {
   std::vector<float> logits = backend_.forward(batch);
   ++stats_.steps;
   const int V = backend_.config().vocab;
-  int row = 0;
+  // Sampling (and log-probabilities) for every row in parallel: each is a pure function of
+  // its row, its parameters and its index, so the order does not matter.
+  std::vector<int> row_of(members.size(), -1);
+  int rows = 0;
+  for (std::size_t i = 0; i < members.size(); ++i)
+    if (batch.seqs[i].want_logits) row_of[i] = rows++;
+  std::vector<int> picked(rows);
+  std::vector<float> lps(rows);
+  if (on_logits)
+    for (std::size_t i = 0; i < members.size(); ++i)
+      if (row_of[i] >= 0) on_logits(members[i]->req.id, members[i]->generated, logits.data() + static_cast<std::size_t>(row_of[i]) * V);
+#pragma omp parallel for schedule(dynamic)
+  for (std::size_t i = 0; i < members.size(); ++i) {
+    if (row_of[i] < 0) continue;
+    const Seq* s = members[i];
+    const float* lg = logits.data() + static_cast<std::size_t>(row_of[i]) * V;
+    if (opt_.logprobs) {
+      double lp = 0;
+      picked[row_of[i]] = sample_with_log_prob(lg, V, s->req.params, static_cast<std::uint64_t>(s->generated), &lp);
+      lps[row_of[i]] = static_cast<float>(lp);
+    } else {
+      picked[row_of[i]] = sample(lg, V, s->req.params, static_cast<std::uint64_t>(s->generated));
+    }
+  }
   for (std::size_t i = 0; i < members.size(); ++i) {
     Seq* s = members[i];
     s->computed += static_cast<int>(batch.seqs[i].tokens.size());
     stats_.forward_tokens += batch.seqs[i].tokens.size();
     alloc_.register_full(s->tokens, s->computed, s->blocks, s->hashes);
-    if (!batch.seqs[i].want_logits) continue;
-    const float* lg = logits.data() + static_cast<std::size_t>(row++) * V;
-    if (on_logits) on_logits(s->req.id, s->generated, lg);
-    int tok = sample(lg, V, s->req.params, static_cast<std::uint64_t>(s->generated));
+    if (row_of[i] < 0) continue;
+    int tok = picked[row_of[i]];
     int index = s->generated++;
     s->tokens.push_back(tok);
     Finish f = Finish::None;
@@ -273,7 +294,7 @@ std::vector<TokenEvent> Engine::step_locked() {
     if (!s->req.params.ignore_eos && std::find(eos.begin(), eos.end(), tok) != eos.end()) f = Finish::Stop;
     else if (s->generated >= s->req.params.max_new_tokens) f = Finish::Length;
     TokenEvent ev{s->req.id, tok, index, f};
-    if (opt_.logprobs) ev.logprob = static_cast<float>(log_prob(lg, V, s->req.params.temperature, tok));
+    if (opt_.logprobs) ev.logprob = lps[row_of[i]];
     events.push_back(ev);
     if (f != Finish::None) s->done = true;
   }

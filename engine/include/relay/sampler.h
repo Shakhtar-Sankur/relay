@@ -1,4 +1,5 @@
-// Picks the next token from a row of logits.
+// Picks the next token from a row of logits. Without truncation (top_k 0, top_p 1) it walks
+// the tokens in id order; with top-k or top-p, in order of decreasing logit.
 //
 // Sampling is a pure function of (logits, params, seed, index): the random number
 // for a request's n-th generated token comes from hashing (seed, n), not from a
@@ -25,6 +26,10 @@ struct SamplingParams {
 double uniform01(std::uint64_t seed, std::uint64_t index);
 
 int sample(const float* logits, int vocab, const SamplingParams& p, std::uint64_t index);
+// sample(), and log_prob(logits, vocab, p.temperature, token) of the token it picks, with
+// the softmax computed once (one exp per logit) when there is no truncation.
+int sample_with_log_prob(const float* logits, int vocab, const SamplingParams& p, std::uint64_t index,
+                         double* log_prob_out);
 int argmax(const float* logits, int vocab);
 // log softmax(logits / temperature)[token], in double precision (temperature <= 0: 1).
 double log_prob(const float* logits, int vocab, float temperature, int token);
