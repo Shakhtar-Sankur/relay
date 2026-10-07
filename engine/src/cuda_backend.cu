@@ -414,6 +414,7 @@ class CudaBackend final : public Backend {
   }
 
   ~CudaBackend() override {
+    cudaSetDevice(device_);
     if (pinned_) cudaFreeHost(pinned_);
     if (cublas_) cublasDestroy(cublas_);
     for (auto e : layer_done_) cudaEventDestroy(e);
@@ -477,19 +478,23 @@ class CudaBackend final : public Backend {
   std::size_t kv_block_bytes() const override { return static_cast<std::size_t>(layout_.block_elems()) * 2; }
 
   void read_kv_block(int layer, int block, void* k_out, void* v_out) override {
+    CUDA_CHECK(cudaSetDevice(device_));
     read_kv_layer(layer, {block}, nullptr, k_out, v_out);
   }
 
   void write_kv_block(int layer, int block, const void* k_in, const void* v_in) override {
+    CUDA_CHECK(cudaSetDevice(device_));
     write_kv_layer(layer, {block}, k_in, v_in);
   }
 
   void read_kv_layer(int layer, const std::vector<int>& blocks, void* out) override {
+    CUDA_CHECK(cudaSetDevice(device_));
     auto* k = static_cast<unsigned char*>(out);
     read_kv_layer(layer, blocks, nullptr, k, k + blocks.size() * kv_block_bytes());
   }
 
   void write_kv_layer(int layer, const std::vector<int>& blocks, const void* in) override {
+    CUDA_CHECK(cudaSetDevice(device_));
     const auto* k = static_cast<const unsigned char*>(in);
     write_kv_layer(layer, blocks, k, k + blocks.size() * kv_block_bytes());
   }
@@ -497,6 +502,7 @@ class CudaBackend final : public Backend {
   void wait_kv_written(int layer) override { CUDA_CHECK(cudaEventSynchronize(layer_done_.at(layer))); }
 
   std::vector<float> forward(const ForwardBatch& batch, LayerObserver* observer) override {
+    CUDA_CHECK(cudaSetDevice(device_));  // the caller's current device may be another GPU (a trainer's)
     const int H = c_.hidden, Q = c_.q_dim(), I = c_.intermediate, D = c_.head_dim, V = c_.vocab;
 
     std::vector<int> tok, pos, seq, table_off, tables, rows;
