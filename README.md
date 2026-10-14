@@ -239,3 +239,7 @@ tests/                  C++ tests; tests/fixtures holds tiny models and their tr
 scripts/                fixture generation, Colab GPU scripts, cluster launcher, load generator, chaos run
 docs/                   design and walkthroughs
 ```
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).
